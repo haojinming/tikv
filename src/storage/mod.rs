@@ -75,9 +75,11 @@ use crate::storage::{
     txn::{commands::TypedCommand, scheduler::Scheduler as TxnScheduler, Command},
     types::StorageCallbackType,
 };
+use codec::number::{self};
 use causal_ts::{CausalTsProvider, TsoSimpleProvider};
 use concurrency_manager::ConcurrencyManager;
-use engine_traits::{util::emplace_causal_ts, CfName, ALL_CFS, CF_DEFAULT, DATA_CFS};
+use engine_traits::{util::emplace_causal_ts_in_key, CfName,
+    ALL_CFS, CF_DEFAULT, DATA_CFS};
 use futures::prelude::*;
 use kvproto::kvrpcpb::{
     CommandPri, Context, GetRequest, IsolationLevel, KeyRange, LockInfo, RawGetRequest,
@@ -977,6 +979,7 @@ impl<E: Engine, L: LockManager> Storage<E, L> {
         let priority = ctx.get_priority();
         let priority_tag = get_priority_tag(priority);
         let enable_ttl = self.enable_ttl;
+        let causal_ts = self.causal_ts.clone();
 
         let res = self.read_pool.spawn_handle(
             async move {
@@ -997,9 +1000,49 @@ impl<E: Engine, L: LockManager> Storage<E, L> {
                 let store = RawStore::new(snapshot, enable_ttl);
                 let cf = Self::rawkv_cf(&cf)?;
                 {
+                    let cur_ts = causal_ts.get_ts().unwrap();
                     let begin_instant = Instant::now_coarse();
                     let mut stats = Statistics::default();
-                    let r = store.raw_get_key_value(cf, &Key::from_encoded(key), &mut stats);
+                    let start_key = Key::from_encoded(key.clone()).append_ts(cur_ts);
+                    let end_key = Key::from_encoded(key.clone()).append_ts(TimeStamp::max());
+                    let result = store.reverse_raw_scan(
+                                cf,
+                                &start_key,
+                                Some(&end_key),
+                                100 as usize,
+                                &mut stats,
+                                false).await;
+                    let r = match result {
+                        Err(e) => Err(e),
+                        Ok(val) => if val.is_empty() {
+                            Ok(None)
+                        } else {
+                            let pair_result: Vec<KvPair> = val.into_iter()
+                                .map(|x| x.unwrap())
+                                .collect();
+                            if pair_result.is_empty() {
+                                Ok(None)
+                            } else {
+                                let mut tmp_r: Result<Option<Vec<u8>>> = Ok(None);
+                                for (ret_key, ret_val) in pair_result {
+                                    if ret_key.len() == key.len() + number::U64_SIZE &&
+                                        ret_key[0..key.len()] == key {
+                                        debug!(
+                                            "(rawkv)raw_get::reverse scan get val";
+                                            "ts" => cur_ts,
+                                            "key" => &log_wrappers::Value::key(&key),
+                                            "value" => &log_wrappers::Value::value(&ret_val),
+                                        );
+                                        tmp_r = Ok(Some(ret_val));
+                                        break;
+                                    }
+                                }
+                                tmp_r
+                            }
+                        }
+                    };
+
+                    // let r = store.raw_get_key_value(cf, &Key::from_encoded(key).append_ts(cur_ts), &mut stats);
                     KV_COMMAND_KEYREAD_HISTOGRAM_STATIC.get(CMD).observe(1_f64);
                     tls_collect_read_flow(ctx.get_region_id(), &stats);
                     SCHED_PROCESSING_READ_HISTOGRAM_STATIC
@@ -1200,7 +1243,8 @@ impl<E: Engine, L: LockManager> Storage<E, L> {
         let mut m = Modify::Put(Self::rawkv_cf(&cf)?, Key::from_encoded(key), value);
         if self.enable_ttl {
             let expire_ts = convert_to_expire_ts(ttl);
-            m.with_extended_fields(expire_ts, Some(TimeStamp::zero()));
+            m.with_ttl(expire_ts);
+            m = m.with_causal_ts(Some(TimeStamp::max()));
         } else if ttl != 0 {
             return Err(Error::from(ErrorInner::TTLNotEnabled));
         }
@@ -1221,12 +1265,12 @@ impl<E: Engine, L: LockManager> Storage<E, L> {
 
                 if req.has_put() {
                     let ts = get_ts().unwrap(); // TODO: error handle
-                    emplace_causal_ts(req.mut_put().mut_value(), ts).unwrap(); // TODO: error handle
+                    emplace_causal_ts_in_key(req.mut_put().mut_key(), ts).unwrap(); // TODO: error handle
                     debug!(
                         "(rawkv)raw_put::pre_propose_cb";
                         "ts" => ts,
                         "key" => &log_wrappers::Value::key(req.get_put().get_key()),
-                        // "value" => &log_wrappers::Value::value(req.get_put().get_value()),
+                        "value" => &log_wrappers::Value::value(req.get_put().get_value()),
                     );
                 }
             }
@@ -4487,6 +4531,60 @@ mod tests {
             } else {
                 assert_eq!(res, Some(0));
             }
+        }
+    }
+
+    #[test]
+    fn test_raw_get_with_timestamp() {
+        let storage = TestStorageBuilder::new(DummyLockManager {}, true)
+            .build()
+            .unwrap();
+        let (tx, rx) = channel();
+
+        let mut test_data = vec![
+            (b"vk00000000".to_vec(), b"_vk00000000".to_vec(), 100),
+            (b"vk10000000".to_vec(), b"_vk10000000".to_vec(), 100),
+            (b"vk20000000".to_vec(), b"_vk20000000".to_vec(), 100),
+            (b"vk30000000".to_vec(), b"_vk30000000".to_vec(), 100),
+            (b"vk40000000".to_vec(), b"_vk40000000".to_vec(), 100),
+            (b"vk50000000".to_vec(), b"_vk50000000".to_vec(), 100), // effective ttl = this value + current_ts.
+        ];
+/*
+        for i in 0..100 {
+            let mut tmp_key: Vec<u8> = Vec::with_capacity(i + 1);
+            let mut tmp_val: Vec<u8> = Vec::with_capacity(101 - i);
+            for _ in 0..4 {
+                tmp_key.push(rand::random());
+            }
+            for _ in 0..(101 - i) {
+                tmp_val.push(rand::random());
+            }
+            test_data.push((tmp_key, tmp_val, 100));
+        }*/
+
+        // Write key-value pairs one by one
+        for &(ref key, ref value, ttl) in &test_data {
+            storage
+                .raw_put(
+                    Context::default(),
+                    "".to_string(),
+                    key.clone(),
+                    value.clone(),
+                    ttl,
+                    expect_ok_callback(tx.clone(), 0),
+                )
+                .unwrap();
+        }
+        rx.recv().unwrap();
+
+        for &(ref key, ref value, _) in &test_data {
+
+            let ret_value = block_on(
+                storage.raw_get(Context::default(), "".to_string(), key.to_vec())).unwrap();
+            expect_value(
+                value.to_vec(),
+                ret_value
+            );
         }
     }
 

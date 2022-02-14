@@ -97,6 +97,19 @@ impl Modify {
             append_extended_fields(v, expire_ts, causal_ts);
         }
     }
+
+    pub fn with_causal_ts(self, causal_ts: Option<TimeStamp>) -> Modify {
+        match self {
+            Modify::Delete(..) => unreachable!(),
+            Modify::Put(cf, key, value) => 
+                Modify::Put(cf, key.append_ts(causal_ts.unwrap()), value.to_vec()),
+            Modify::DeleteRange(..) => unreachable!(),
+        }
+        /*
+        if let Modify::Put(cf, key, value) = self {
+            Modify::Put(cf, key.append_ts(causal_ts.unwrap()), value);
+        }*/
+    }
 }
 
 #[derive(Default)]
