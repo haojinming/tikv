@@ -1004,7 +1004,7 @@ impl<E: Engine, L: LockManager> Storage<E, L> {
                     let begin_instant = Instant::now_coarse();
                     let mut stats = Statistics::default();
                     let cur_ts = causal_ts.get_ts().unwrap();
-                    let r = store.raw_get_key_value(cf, &Key::from_raw(&key), &mut stats, cur_ts);
+                    let r = store.raw_get_key_value(cf, &Key::from_encoded(key), &mut stats, cur_ts);
                     KV_COMMAND_KEYREAD_HISTOGRAM_STATIC.get(CMD).observe(1_f64);
                     tls_collect_read_flow(ctx.get_region_id(), &stats);
                     SCHED_PROCESSING_READ_HISTOGRAM_STATIC
@@ -1205,11 +1205,11 @@ impl<E: Engine, L: LockManager> Storage<E, L> {
         callback: Callback<()>,
     ) -> Result<()> {
         check_key_size!(Some(&key).into_iter(), self.max_key_size, callback);
-        let mut m = Modify::Put(Self::rawkv_cf(&cf)?, Key::from_raw(&key), value);
+        let mut m = Modify::Put(Self::rawkv_cf(&cf)?, Key::from_encoded(key), value);
         if self.enable_ttl {
             let expire_ts = convert_to_expire_ts(ttl);
             m.with_ttl(expire_ts);
-            m = m.with_causal_ts(Some(TimeStamp::zero()));
+            m = m.with_causal_ts(Some(TimeStamp::max()));
         } else if ttl != 0 {
             return Err(Error::from(ErrorInner::TTLNotEnabled));
         }

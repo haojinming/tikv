@@ -39,7 +39,7 @@ impl<'a, S: Snapshot> RawStore<S> {
         stats: &mut Statistics,
         causal_ts: TimeStamp
     ) -> Result<Option<Vec<u8>>> {
-        let start_key = key.clone().append_ts(causal_ts);
+        let start_key = key.clone().append_ts(TimeStamp::max());
         let end_key = key.clone().append_ts(TimeStamp::zero());
         let result = block_on(self.forward_raw_scan(
                     cf,
