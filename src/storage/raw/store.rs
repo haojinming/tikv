@@ -7,7 +7,9 @@ use crate::storage::Statistics;
 use crate::storage::{Error, Result};
 
 use engine_traits::{CfName, IterOptions, DATA_KEY_PREFIX_LEN};
-use txn_types::{Key, KvPair};
+use txn_types::{Key, KvPair, TimeStamp};
+use codec::number::{self};
+use futures::executor::block_on;
 
 use std::time::Duration;
 use tikv_util::time::Instant;
@@ -35,11 +37,62 @@ impl<'a, S: Snapshot> RawStore<S> {
         cf: CfName,
         key: &Key,
         stats: &mut Statistics,
+        causal_ts: TimeStamp
     ) -> Result<Option<Vec<u8>>> {
+        let start_key = key.clone().append_ts(causal_ts);
+        let end_key = key.clone().append_ts(TimeStamp::zero());
+        let result = block_on(self.forward_raw_scan(
+                    cf,
+                    &start_key,
+                    Some(&end_key),
+                    1 as usize,
+                    stats,
+                    false));
+        let r = match result {
+            Err(e) => Err(e),
+            Ok(val) => if val.is_empty() {
+                debug!("(rawkv) forward scan get empty resultm start {}, end {} key {} ts {}",
+                &log_wrappers::Value::key(&start_key.into_encoded()),
+                &log_wrappers::Value::key(&end_key.into_encoded()),
+                &log_wrappers::Value::key(&key.clone().into_encoded()),
+                causal_ts);
+                Ok(None)
+            } else {
+                let pair_result: Vec<KvPair> = val.into_iter()
+                    .map(|x| x.unwrap())
+                    .collect();
+                if pair_result.is_empty() {
+                    info!("(rawkv) forward scan get empty kvpair result.");
+                    Ok(None)
+                } else {
+                    let mut tmp_r: Result<Option<Vec<u8>>> = Ok(None);
+                    for (ret_key, ret_val) in pair_result {
+                        let key_len = key.as_encoded().len();
+                        if ret_key.len() == key_len + number::U64_SIZE &&
+                            Key::from_encoded(ret_key[0..key_len].to_vec()) == key.clone() {
+                            debug!(
+                                "(rawkv)raw_get::reverse scan get val";
+                                "ts" => causal_ts,
+                                "key" => &log_wrappers::Value::key(&ret_key),
+                                "value" => &log_wrappers::Value::value(&ret_val),
+                            );
+                            tmp_r = Ok(Some(ret_val));
+                            break;
+                        }
+                    }
+                    if let Ok(None) = tmp_r {
+                        info!("(rawkv) forward scan get non empty kvpair result, but no same key.");
+                    }
+                    tmp_r
+                }
+            }
+        };
+        r
+        /*
         match self {
             RawStore::Vanilla(inner) => inner.raw_get_key_value(cf, key, stats),
             RawStore::TTL(inner) => inner.raw_get_key_value(cf, key, stats),
-        }
+        }*/
     }
 
     pub fn raw_get_key_ttl(
@@ -185,6 +238,9 @@ impl<'a, S: Snapshot> RawStoreInner<S> {
                     cursor.value(statistics).to_owned()
                 },
             )));
+            if pairs.len() >= limit {
+                break;
+            }
             cursor.next(statistics);
         }
         Ok(pairs)
@@ -233,6 +289,9 @@ impl<'a, S: Snapshot> RawStoreInner<S> {
                     cursor.value(statistics).to_owned()
                 },
             )));
+            if pairs.len() >= limit {
+                break;
+            }
             cursor.prev(statistics);
         }
         Ok(pairs)

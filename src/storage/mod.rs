@@ -1000,49 +1000,11 @@ impl<E: Engine, L: LockManager> Storage<E, L> {
                 let store = RawStore::new(snapshot, enable_ttl);
                 let cf = Self::rawkv_cf(&cf)?;
                 {
-                    let cur_ts = causal_ts.get_ts().unwrap();
+                    
                     let begin_instant = Instant::now_coarse();
                     let mut stats = Statistics::default();
-                    let start_key = Key::from_encoded(key.clone()).append_ts(cur_ts);
-                    let end_key = Key::from_encoded(key.clone()).append_ts(TimeStamp::max());
-                    let result = store.reverse_raw_scan(
-                                cf,
-                                &start_key,
-                                Some(&end_key),
-                                100 as usize,
-                                &mut stats,
-                                false).await;
-                    let r = match result {
-                        Err(e) => Err(e),
-                        Ok(val) => if val.is_empty() {
-                            Ok(None)
-                        } else {
-                            let pair_result: Vec<KvPair> = val.into_iter()
-                                .map(|x| x.unwrap())
-                                .collect();
-                            if pair_result.is_empty() {
-                                Ok(None)
-                            } else {
-                                let mut tmp_r: Result<Option<Vec<u8>>> = Ok(None);
-                                for (ret_key, ret_val) in pair_result {
-                                    if ret_key.len() == key.len() + number::U64_SIZE &&
-                                        ret_key[0..key.len()] == key {
-                                        debug!(
-                                            "(rawkv)raw_get::reverse scan get val";
-                                            "ts" => cur_ts,
-                                            "key" => &log_wrappers::Value::key(&key),
-                                            "value" => &log_wrappers::Value::value(&ret_val),
-                                        );
-                                        tmp_r = Ok(Some(ret_val));
-                                        break;
-                                    }
-                                }
-                                tmp_r
-                            }
-                        }
-                    };
-
-                    // let r = store.raw_get_key_value(cf, &Key::from_encoded(key).append_ts(cur_ts), &mut stats);
+                    let cur_ts = causal_ts.get_ts().unwrap();
+                    let r = store.raw_get_key_value(cf, &Key::from_raw(&key), &mut stats, cur_ts);
                     KV_COMMAND_KEYREAD_HISTOGRAM_STATIC.get(CMD).observe(1_f64);
                     tls_collect_read_flow(ctx.get_region_id(), &stats);
                     SCHED_PROCESSING_READ_HISTOGRAM_STATIC
@@ -1076,6 +1038,7 @@ impl<E: Engine, L: LockManager> Storage<E, L> {
         let priority = gets[0].get_context().get_priority();
         let priority_tag = get_priority_tag(priority);
         let enable_ttl = self.enable_ttl;
+        let causal_ts = self.causal_ts.clone();
 
         let res = self.read_pool.spawn_handle(
             async move {
@@ -1122,6 +1085,7 @@ impl<E: Engine, L: LockManager> Storage<E, L> {
                                             cf,
                                             &Key::from_encoded(key),
                                             &mut stats,
+                                            causal_ts.get_ts().unwrap()
                                         ),
                                     );
                                     tls_collect_read_flow(ctx.get_region_id(), &stats);
@@ -1165,6 +1129,7 @@ impl<E: Engine, L: LockManager> Storage<E, L> {
         let priority = ctx.get_priority();
         let priority_tag = get_priority_tag(priority);
         let enable_ttl = self.enable_ttl;
+        let causal_ts = self.causal_ts.clone();
 
         let res = self.read_pool.spawn_handle(
             async move {
@@ -1196,7 +1161,7 @@ impl<E: Engine, L: LockManager> Storage<E, L> {
                     let result: Vec<Result<KvPair>> = keys
                         .into_iter()
                         .map(|k| {
-                            let v = store.raw_get_key_value(cf, &k, &mut stats);
+                            let v = store.raw_get_key_value(cf, &k, &mut stats, causal_ts.get_ts().unwrap());
                             (k, v)
                         })
                         .filter(|&(_, ref v)| !(v.is_ok() && v.as_ref().unwrap().is_none()))
@@ -1240,11 +1205,11 @@ impl<E: Engine, L: LockManager> Storage<E, L> {
         callback: Callback<()>,
     ) -> Result<()> {
         check_key_size!(Some(&key).into_iter(), self.max_key_size, callback);
-        let mut m = Modify::Put(Self::rawkv_cf(&cf)?, Key::from_encoded(key), value);
+        let mut m = Modify::Put(Self::rawkv_cf(&cf)?, Key::from_raw(&key), value);
         if self.enable_ttl {
             let expire_ts = convert_to_expire_ts(ttl);
             m.with_ttl(expire_ts);
-            m = m.with_causal_ts(Some(TimeStamp::max()));
+            m = m.with_causal_ts(Some(TimeStamp::zero()));
         } else if ttl != 0 {
             return Err(Error::from(ErrorInner::TTLNotEnabled));
         }
@@ -1270,7 +1235,7 @@ impl<E: Engine, L: LockManager> Storage<E, L> {
                         "(rawkv)raw_put::pre_propose_cb";
                         "ts" => ts,
                         "key" => &log_wrappers::Value::key(req.get_put().get_key()),
-                        "value" => &log_wrappers::Value::value(req.get_put().get_value()),
+                        // "value" => &log_wrappers::Value::value(req.get_put().get_value()),
                     );
                 }
             }

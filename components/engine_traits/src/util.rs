@@ -213,7 +213,7 @@ pub fn strip_extended_fields(value_with_extended: &[u8]) -> &[u8] {
 
 #[inline]
 pub fn append_causal_ts(key: &mut Vec<u8>, causal_ts: u64) {
-    key.encode_u64(causal_ts).unwrap();
+    key.encode_u64_desc(causal_ts).unwrap();
 }
 
 // pub fn truncate_expire_ts(value_with_ttl: &mut Vec<u8>) -> Result<()> {
@@ -255,17 +255,24 @@ pub fn emplace_causal_ts_in_key(extend_key: &mut Vec<u8>, causal_ts: TimeStamp) 
     }
     let start_idx = extend_key.len() - number::U64_SIZE;
     let mut buf = &mut extend_key[start_idx..start_idx + number::U64_SIZE];
-    byteorder::BigEndian::write_u64(&mut buf, causal_ts.into_inner());
+    byteorder::BigEndian::write_u64(&mut buf, !causal_ts.into_inner());
     Ok(())
 }
 
 #[inline]
 pub fn get_causal_ts(value_with_extended: &[u8]) -> Option<TimeStamp> {
+    let len = value_with_extended.len();
+    if len < number::U64_SIZE {
+        return None;
+    }
+    let mut data = &value_with_extended[len - number::U64_SIZE..];
+    return Some((number::decode_u64_desc(&mut data).unwrap()).into());
+    /*
     let result = ExtendedFields::extract(value_with_extended);
     match result {
         Ok((e, _, _)) => e.causal_ts(),
         Err(_) => None,
-    }
+    }*/
 }
 
 #[cfg(test)]
@@ -358,7 +365,9 @@ mod tests {
 
         let mut expect_key = b"key_pingcap".to_vec();
         append_causal_ts(&mut expect_key, 200);
-
         assert_eq!(key, expect_key);
+
+        let timeStamp = get_causal_ts(&key);
+        assert_eq!(timeStamp.unwrap().into_inner(), 200);
     }
 }

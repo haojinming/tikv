@@ -117,7 +117,7 @@ impl<E: KvEngine> CmdObserver<E> for CausalObserver {
         debug!("(rawkv)CausalObserver on_apply_cmd"; "region" => region_id, "cmd" => ?cmd);
         for req in cmd.request.requests.iter().rev() {
             if req.has_put() {
-                if let Some(ts) = get_causal_ts(req.get_put().get_value()) {
+                if let Some(ts) = get_causal_ts(req.get_put().get_key()) {
                     self.causal_manager.update_max_ts(region_id, ts);
                     debug!("(rawkv)CausalObserver on_apply_cmd.update_max_ts"; "region" => region_id, "ts" => ts, "causal_manager" => ?self.causal_manager);
                     break; // (rawkv)causal_ts must be incremental in a batch.

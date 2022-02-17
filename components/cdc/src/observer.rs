@@ -249,7 +249,7 @@ impl QueryObserver for CdcObserver {
             debug!("(rawkv)cdc::CdcObserver::pre_propose_query"; "region_id" => region_id, "req" => ?requests);
             for req in requests {
                 if req.has_put() {
-                    if let Some(ts) = get_causal_ts(req.get_put().get_value()) {
+                    if let Some(ts) = get_causal_ts(req.get_put().get_key()) {
                         // resolved_ts should be smaller than commit_ts, so use ts.prev() here.
                         let track_ts = ts.prev();
                         // track the first request ONLY. TS in batch is increasing.
