@@ -9,6 +9,7 @@ use engine_traits::{CfName, IterOptions, Iterable, Iterator, KvEngine, CF_WRITE,
 use kvproto::metapb::Region;
 use kvproto::metapb::RegionEpoch;
 use kvproto::pdpb::CheckPolicy;
+use protobuf::ProtobufEnum;
 
 #[cfg(any(test, feature = "testexport"))]
 use crate::coprocessor::Config;
@@ -190,7 +191,7 @@ where
         let region_id = region.get_id();
         let start_key = keys::enc_start_key(region);
         let end_key = keys::enc_end_key(region);
-        debug!(
+        info!(
             "executing task";
             "region_id" => region_id,
             "start_key" => log_wrappers::Value::key(&start_key),
@@ -202,12 +203,15 @@ where
             self.coprocessor
                 .new_split_checker_host(region, &self.engine, auto_split, policy);
         if host.skip() {
-            debug!("skip split check"; "region_id" => region.get_id());
+            info!("skip split check"; "region_id" => region.get_id());
             return;
         }
-
+        info!("split check policy, region id: {}, policy {}", region_id, host.policy().value());
         let split_keys = match host.policy() {
             CheckPolicy::Scan => {
+                info!{"get split from scan keys:";
+                    "region_id" => region_id,
+                };
                 match self.scan_split_keys(&mut host, region, &start_key, &end_key) {
                     Ok(keys) => keys,
                     Err(e) => {
@@ -238,9 +242,18 @@ where
             CheckPolicy::Usekey => vec![], // Handled by pd worker directly.
         };
 
-        if !split_keys.is_empty() {
+        let mut new_split_keys: Vec<Vec<u8>> = Vec::new();
+        for split_key in split_keys {
+            let tmp_split_key: Vec<u8> = if split_key.len() > 8 {
+                split_key[0..split_key.len() - 8].to_vec()
+            } else {
+                split_key.clone()
+            };
+            new_split_keys.push(tmp_split_key);
+        }
+        if !new_split_keys.is_empty() {
             let region_epoch = region.get_region_epoch().clone();
-            let msg = new_split_region(region_epoch, split_keys, "split checker");
+            let msg = new_split_region(region_epoch, new_split_keys, "split checker");
             let res = self.router.send(region_id, msg);
             if let Err(e) = res {
                 warn!("failed to send check result"; "region_id" => region_id, "err" => %e);

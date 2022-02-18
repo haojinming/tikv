@@ -987,6 +987,11 @@ impl<EK: KvEngine, ER: RaftEngine, T> RaftPollerBuilder<EK, ER, T> {
                 RegionChangeEvent::Create,
                 StateRole::Follower,
             );
+            info!(
+                "create region";
+                "region_id" => region_id,
+                "region" => ?region.clone(),
+            );
             Ok(true)
         })?;
 
