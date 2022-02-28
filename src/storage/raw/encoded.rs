@@ -5,9 +5,9 @@ use crate::storage::kv::{Iterator, Result, Snapshot, TTL_TOMBSTONE};
 use crate::storage::Statistics;
 
 use api_version::APIVersion;
+use kvproto::kvrpcpb::ApiVersion;
 use engine_traits::raw_ttl::ttl_current_ts;
-use engine_traits::CfName;
-use engine_traits::{IterOptions, ReadOptions};
+use engine_traits::{CfName, IterOptions, ReadOptions};
 use std::marker::PhantomData;
 use txn_types::{Key, Value};
 
@@ -52,7 +52,11 @@ impl<S: Snapshot, API: APIVersion> RawEncodeSnapshot<S, API> {
     ) -> Result<Option<u64>> {
         stats.data.flow_stats.read_keys = 1;
         stats.data.flow_stats.read_bytes = key.as_encoded().len();
-        if let Some(v) = self.snap.get_cf(cf, key)? {
+        let value = match API::TAG {
+            ApiVersion::V2 => self.seek_first_key_value_cf(None, Some(cf), key)?,
+            _ => self.snap.get_cf(cf, key)?,
+        };
+        if let Some(v) = value {
             stats.data.flow_stats.read_bytes += v.len();
             let raw_value = API::decode_raw_value_owned(v)?;
             return match raw_value.expire_ts {
@@ -62,6 +66,29 @@ impl<S: Snapshot, API: APIVersion> RawEncodeSnapshot<S, API> {
             };
         }
         Ok(None)
+    }
+
+    pub fn seek_first_key_value_cf(
+        &self,
+        opts: Option<ReadOptions>,
+        cf: Option<CfName>,
+        key: &Key,
+    ) -> Result<Option<Value>> {
+        let mut iter_opt = IterOptions::default();
+        iter_opt.set_fill_cache(opts.map_or(true, |v| v.fill_cache()));
+        iter_opt.use_prefix_seek();
+        iter_opt.set_prefix_same_as_start(true);
+        let mut iter = match cf {
+            Some(cf_name) => self.iter_cf(cf_name, iter_opt)?,
+            None => self.iter(iter_opt)?,
+        };
+        if !iter.seek(key)? {
+            Ok(Some(vec![]))
+        } else if iter.valid()? {
+            Ok(Some(iter.value_with_ttl().to_owned()))
+        } else {
+            Ok(Some(vec![]))
+        }
     }
 }
 
@@ -73,15 +100,26 @@ impl<S: Snapshot, API: APIVersion> Snapshot for RawEncodeSnapshot<S, API> {
     = S::Ext<'a>;
 
     fn get(&self, key: &Key) -> Result<Option<Value>> {
-        self.map_value(self.snap.get(key))
+        match API::TAG {
+            ApiVersion::V2 => 
+                self.map_value(self.seek_first_key_value_cf(None, None, key)),
+            _ => self.map_value(self.snap.get(key))
+        }
     }
 
     fn get_cf(&self, cf: CfName, key: &Key) -> Result<Option<Value>> {
-        self.map_value(self.snap.get_cf(cf, key))
+        match API::TAG {
+            ApiVersion::V2 => 
+                self.map_value(self.seek_first_key_value_cf(None, Some(cf), key)),
+            _ => self.map_value(self.snap.get_cf(cf, key))
+        }
     }
 
     fn get_cf_opt(&self, opts: ReadOptions, cf: CfName, key: &Key) -> Result<Option<Value>> {
-        self.map_value(self.snap.get_cf_opt(opts, cf, key))
+        match API::TAG {
+            ApiVersion::V2 => self.seek_first_key_value_cf(Some(opts),Some(cf), key),
+            _ => self.map_value(self.snap.get_cf_opt(opts, cf, key))
+        }
     }
 
     fn iter(&self, iter_opt: IterOptions) -> Result<Self::Iter> {
@@ -155,6 +193,10 @@ impl<I: Iterator, API: APIVersion> RawEncodeIterator<I, API> {
             break;
         }
         res
+    }
+
+    fn value_with_ttl(&self) -> &[u8] {
+        self.inner.value()
     }
 }
 

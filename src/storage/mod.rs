@@ -80,7 +80,7 @@ use crate::storage::{
     types::StorageCallbackType,
 };
 
-use api_version::{match_template_api_version, APIVersion, KeyMode, RawValue, APIV2};
+use api_version::{match_template_api_version, APIVersion, KeyMode, RawKey, RawValue, APIV2};
 use concurrency_manager::ConcurrencyManager;
 use engine_traits::{raw_ttl::ttl_to_expire_ts, CfName, CF_DEFAULT, CF_LOCK, CF_WRITE, DATA_CFS};
 use futures::prelude::*;
@@ -1651,21 +1651,26 @@ impl<E: Engine, L: LockManager> Storage<E, L> {
 
         check_key_size!(Some(&key).into_iter(), self.max_key_size, callback);
 
+        let causal_ts: u64 = 0;
+
         let m = match_template_api_version!(
             API,
             match self.api_version {
                 ApiVersion::API => {
                     if !API::IS_TTL_ENABLED && ttl != 0 {
                         return Err(Error::from(ErrorInner::TTLNotEnabled));
-                    }
-
+                    }/*
+                    let raw_key = RawKey {
+                        user_key: key,
+                        ts: Some(causal_ts),
+                    };*/
                     let raw_value = RawValue {
                         user_value: value,
                         expire_ts: ttl_to_expire_ts(ttl),
                     };
                     Modify::Put(
                         Self::rawkv_cf(&cf, self.api_version)?,
-                        Key::from_encoded(key),
+                        Key::from_encoded(key /*API::encode_raw_key_owned(raw_key).unwrap()*/),
                         API::encode_raw_value_owned(raw_value),
                     )
                 }
