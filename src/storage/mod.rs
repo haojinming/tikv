@@ -109,6 +109,8 @@ use txn_types::{Key, KvPair, Lock, OldValues, RawMutation, TimeStamp, TsSet, Val
 pub type Result<T> = std::result::Result<T, Error>;
 pub type Callback<T> = Box<dyn FnOnce(Result<T>) + Send>;
 
+const API_V2_DELETE_TTL: u64 = 24 * 60 * 60; // 24h by default.
+
 /// [`Storage`](Storage) implements transactional KV APIs and raw KV APIs on a given [`Engine`].
 /// An [`Engine`] provides low level KV functionality. [`Engine`] has multiple implementations.
 /// When a TiKV server is running, a [`RaftKv`](crate::server::raftkv::RaftKv) will be the
@@ -1374,14 +1376,21 @@ impl<E: Engine, L: LockManager> Storage<E, L> {
             .resource_tag_factory
             .new_tag_with_key_ranges(&ctx, vec![(key.clone(), key.clone())]);
         let api_version = self.api_version;
+        let raw_key = match api_version {
+            ApiVersion::V2 => APIV2::encode_raw_key_owned(RawKey{
+                user_key: key.clone(),
+                ts: None,
+            }).unwrap(),
+            _ => key,
+        };
 
         let res = self.read_pool.spawn_handle(
             async move {
                 tls_collect_query(
                     ctx.get_region_id(),
                     ctx.get_peer(),
-                    &key,
-                    &key,
+                    &raw_key,
+                    &raw_key,
                     false,
                     QueryKind::Get,
                 );
@@ -1391,7 +1400,7 @@ impl<E: Engine, L: LockManager> Storage<E, L> {
                     .get(priority_tag)
                     .inc();
 
-                Self::check_api_version(api_version, ctx.api_version, CMD, [&key])?;
+                Self::check_api_version(api_version, ctx.api_version, CMD, [&raw_key])?;
 
                 let command_duration = tikv_util::time::Instant::now_coarse();
                 let snap_ctx = SnapContext {
@@ -1406,7 +1415,7 @@ impl<E: Engine, L: LockManager> Storage<E, L> {
                     let begin_instant = Instant::now_coarse();
                     let mut stats = Statistics::default();
                     let r = store
-                        .raw_get_key_value(cf, &Key::from_encoded(key), &mut stats)
+                        .raw_get_key_value(cf, &Key::from_encoded(raw_key), &mut stats)
                         .map_err(Error::from);
                     KV_COMMAND_KEYREAD_HISTOGRAM_STATIC.get(CMD).observe(1_f64);
                     tls_collect_read_flow(ctx.get_region_id(), &stats);
@@ -1448,9 +1457,16 @@ impl<E: Engine, L: LockManager> Storage<E, L> {
         let rand_index = rand::thread_rng().gen_range(0, gets.len());
         let rand_ctx = gets[rand_index].get_context();
         let rand_key = gets[rand_index].get_key().to_vec();
+        let rand_raw_key = match api_version {
+            ApiVersion::V2 => APIV2::encode_raw_key_owned(RawKey{
+                user_key: rand_key,
+                ts: None,
+            }).unwrap(),
+            _ => rand_key,
+        };
         let resource_tag = self
             .resource_tag_factory
-            .new_tag_with_key_ranges(rand_ctx, vec![(rand_key.clone(), rand_key)]);
+            .new_tag_with_key_ranges(rand_ctx, vec![(rand_raw_key.clone(), rand_raw_key)]);
 
         let res = self.read_pool.spawn_handle(
             async move {
@@ -1496,6 +1512,13 @@ impl<E: Engine, L: LockManager> Storage<E, L> {
                     let ctx = req.take_context();
                     let cf = req.take_cf();
                     let key = req.take_key();
+                    let raw_key = match api_version {
+                        ApiVersion::V2 => APIV2::encode_raw_key_owned(RawKey{
+                            user_key: key,
+                            ts: None,
+                        }).unwrap(),
+                        _ => key,
+                    };
                     match snap.await {
                         Ok(snapshot) => {
                             let mut stats = Statistics::default();
@@ -1507,7 +1530,7 @@ impl<E: Engine, L: LockManager> Storage<E, L> {
                                         store
                                             .raw_get_key_value(
                                                 cf,
-                                                &Key::from_encoded(key),
+                                                &Key::from_encoded(raw_key),
                                                 &mut stats,
                                             )
                                             .map_err(Error::from),
@@ -1554,16 +1577,21 @@ impl<E: Engine, L: LockManager> Storage<E, L> {
         const CMD: CommandKind = CommandKind::raw_batch_get;
         let priority = ctx.get_priority();
         let priority_tag = get_priority_tag(priority);
-        let key_ranges = keys.iter().map(|k| (k.clone(), k.clone())).collect();
+        let api_version = self.api_version;
+        let raw_keys: Vec<Vec<u8>> = keys.iter().map(|k| match api_version {
+            ApiVersion::V2 => APIV2::encode_raw_key_owned(RawKey{user_key: k.to_owned(), ts: None}).unwrap(),
+            _ => k.to_owned(),
+        }).collect();
+        let key_ranges = raw_keys.iter().map(|k| (k.clone(), k.clone())).collect();
         let resource_tag = self
             .resource_tag_factory
             .new_tag_with_key_ranges(&ctx, key_ranges);
-        let api_version = self.api_version;
+        
 
         let res = self.read_pool.spawn_handle(
             async move {
                 let mut key_ranges = vec![];
-                for key in &keys {
+                for key in &raw_keys {
                     key_ranges.push(build_key_range(key, key, false));
                 }
                 tls_collect_query_batch(
@@ -1578,7 +1606,7 @@ impl<E: Engine, L: LockManager> Storage<E, L> {
                     .get(priority_tag)
                     .inc();
 
-                Self::check_api_version(api_version, ctx.api_version, CMD, &keys)?;
+                Self::check_api_version(api_version, ctx.api_version, CMD, &raw_keys)?;
 
                 let command_duration = tikv_util::time::Instant::now_coarse();
                 let snap_ctx = SnapContext {
@@ -1598,8 +1626,14 @@ impl<E: Engine, L: LockManager> Storage<E, L> {
                         .into_iter()
                         .map(Key::from_encoded)
                         .map(|k| {
+                            let raw_key = match api_version {
+                                ApiVersion::V2 => 
+                                    Key::from_encoded(
+                                        APIV2::encode_raw_key_owned(RawKey{user_key: k.to_owned().into_encoded(), ts: None}).unwrap()),
+                                _ => k.to_owned(),
+                            };
                             let v = store
-                                .raw_get_key_value(cf, &k, &mut stats)
+                                .raw_get_key_value(cf, &raw_key, &mut stats)
                                 .map_err(Error::from);
                             (k, v)
                         })
@@ -1651,26 +1685,26 @@ impl<E: Engine, L: LockManager> Storage<E, L> {
 
         check_key_size!(Some(&key).into_iter(), self.max_key_size, callback);
 
-        let causal_ts: u64 = 0;
-
+        let causal_ts: u64 = 1; // TODO: update this after CausalComponent is supported.
         let m = match_template_api_version!(
             API,
             match self.api_version {
                 ApiVersion::API => {
                     if !API::IS_TTL_ENABLED && ttl != 0 {
                         return Err(Error::from(ErrorInner::TTLNotEnabled));
-                    }/*
+                    }
                     let raw_key = RawKey {
                         user_key: key,
                         ts: Some(causal_ts),
-                    };*/
+                    };
                     let raw_value = RawValue {
                         user_value: value,
                         expire_ts: ttl_to_expire_ts(ttl),
+                        is_delete: None,
                     };
                     Modify::Put(
                         Self::rawkv_cf(&cf, self.api_version)?,
-                        Key::from_encoded(key /*API::encode_raw_key_owned(raw_key).unwrap()*/),
+                        Key::from_encoded(API::encode_raw_key_owned(raw_key)?),
                         API::encode_raw_value_owned(raw_value),
                     )
                 }
@@ -1729,13 +1763,19 @@ impl<E: Engine, L: LockManager> Storage<E, L> {
                         .into_iter()
                         .zip(ttls)
                         .map(|((k, v), ttl)| {
+                            let causal_ts: u64 = 1; // TODO: update this after CausalComponent is supported.
+                            let raw_key = RawKey {
+                                user_key: k,
+                                ts: Some(causal_ts),
+                            };
                             let raw_value = RawValue {
                                 user_value: v,
                                 expire_ts: ttl_to_expire_ts(ttl),
+                                is_delete: Some(false),
                             };
                             Modify::Put(
                                 cf,
-                                Key::from_encoded(k),
+                                Key::from_encoded(API::encode_raw_key_owned(raw_key).unwrap()),
                                 API::encode_raw_value_owned(raw_value),
                             )
                         })
@@ -1772,11 +1812,29 @@ impl<E: Engine, L: LockManager> Storage<E, L> {
         )?;
 
         check_key_size!(Some(&key).into_iter(), self.max_key_size, callback);
-
-        let mut batch = WriteData::from_modifies(vec![Modify::Delete(
-            Self::rawkv_cf(&cf, self.api_version)?,
-            Key::from_encoded(key),
-        )]);
+        let mut batch = match self.api_version {
+            ApiVersion::V2 => {
+                let causal_ts: u64 = 100; // TODO: update this after CausalComponent is supported.
+                let raw_key = RawKey {
+                    user_key: key,
+                    ts: Some(causal_ts),
+                };
+                let raw_value = RawValue {
+                    user_value: vec![],
+                    expire_ts: ttl_to_expire_ts(API_V2_DELETE_TTL),
+                    is_delete: Some(true),
+                };
+                WriteData::from_modifies(vec![Modify::Put(
+                    Self::rawkv_cf(&cf, self.api_version)?,
+                    Key::from_encoded(APIV2::encode_raw_key_owned(raw_key)?),
+                    APIV2::encode_raw_value_owned(raw_value),
+                )])
+            },
+            _ => WriteData::from_modifies(vec![Modify::Delete(
+                Self::rawkv_cf(&cf, self.api_version)?,
+                Key::from_encoded(key),
+            )]),
+        };
         batch.set_allowed_on_disk_almost_full();
 
         self.engine.async_write(
@@ -1804,10 +1862,30 @@ impl<E: Engine, L: LockManager> Storage<E, L> {
             CommandKind::raw_delete_range,
             [(Some(&start_key), Some(&end_key))],
         )?;
+        let raw_start_key = RawKey {
+            user_key: start_key.clone(),
+            ts: match self.api_version {
+                ApiVersion::V2 => Some(std::u64::MAX),
+                _ => None,
+            },
+        };
+        let raw_end_key = RawKey {
+            user_key: end_key.clone(),
+            ts: match self.api_version {
+                ApiVersion::V2 => Some(std::u64::MAX),
+                _ => None,
+            },
+        };
 
         let cf = Self::rawkv_cf(&cf, self.api_version)?;
-        let start_key = Key::from_encoded(start_key);
-        let end_key = Key::from_encoded(end_key);
+        let start_key = Key::from_encoded(match self.api_version {
+            ApiVersion::V2 => APIV2::encode_raw_key_owned(raw_start_key)?,
+            _ => start_key,
+        });
+        let end_key = Key::from_encoded(match self.api_version {
+            ApiVersion::V2 => APIV2::encode_raw_key_owned(raw_end_key)?,
+            _ => end_key,
+        });
 
         let mut batch =
             WriteData::from_modifies(vec![Modify::DeleteRange(cf, start_key, end_key, false)]);
@@ -1842,7 +1920,28 @@ impl<E: Engine, L: LockManager> Storage<E, L> {
 
         let modifies = keys
             .into_iter()
-            .map(|k| Modify::Delete(cf, Key::from_encoded(k)))
+            .map(|k| {
+                match self.api_version {
+                    ApiVersion::V2 => {
+                        let causal_ts: u64 = 100; // TODO: update this after CausalComponent is supported.
+                        let raw_key = RawKey {
+                            user_key: k,
+                            ts: Some(causal_ts),
+                        };
+                        let raw_value = RawValue {
+                            user_value: vec![],
+                            expire_ts: ttl_to_expire_ts(API_V2_DELETE_TTL),
+                            is_delete: Some(true),
+                        };
+                        Modify::Put(
+                            cf,
+                            Key::from_encoded(APIV2::encode_raw_key_owned(raw_key).unwrap()),
+                            APIV2::encode_raw_value_owned(raw_value),
+                        )
+                    },
+                    _ => Modify::Delete(cf, Key::from_encoded(k)),
+                }
+            })
             .collect();
 
         let mut batch = WriteData::from_modifies(modifies);
@@ -4288,6 +4387,90 @@ mod tests {
                 .unwrap()
                 .0,
         );
+    }
+
+    #[test]
+    fn test_raw_delete() {
+        test_raw_delete_impl(ApiVersion::V1);
+        test_raw_delete_impl(ApiVersion::V1ttl);
+        test_raw_delete_impl(ApiVersion::V2);
+    }
+
+    fn test_raw_delete_impl(api_version: ApiVersion) {
+        let storage = TestStorageBuilder::new(DummyLockManager {}, api_version)
+            .build()
+            .unwrap();
+        let (tx, rx) = channel();
+        let req_api_version = if api_version == ApiVersion::V1ttl {
+            ApiVersion::V1
+        } else {
+            api_version
+        };
+        let ctx = Context {
+            api_version: req_api_version,
+            ..Default::default()
+        };
+
+        let test_data = [
+            (b"r\0a", b"001"),
+            (b"r\0b", b"002"),
+            (b"r\0c", b"003"),
+            (b"r\0d", b"004"),
+            (b"r\0e", b"005"),
+        ];
+
+        // Write some key-value pairs to the db
+        for kv in &test_data {
+            storage
+                .raw_put(
+                    ctx.clone(),
+                    "".to_string(),
+                    kv.0.to_vec(),
+                    kv.1.to_vec(),
+                    if api_version == ApiVersion::V1 {0} else {30},
+                    expect_ok_callback(tx.clone(), 0),
+                )
+                .unwrap();
+        }
+
+        expect_value(
+            b"004".to_vec(),
+            block_on(storage.raw_get(ctx.clone(), "".to_string(), b"r\0d".to_vec())).unwrap(),
+        );
+
+        // Delete "a"
+        storage.raw_delete(
+            ctx.clone(),
+            "".to_string(),
+            b"r\0a".to_vec(),
+            expect_ok_callback(tx.clone(), 1),
+        ).unwrap();
+        rx.recv().unwrap();
+
+        // Assert key "a" has gone
+        expect_none(
+            block_on(storage.raw_get(ctx.clone(), "".to_string(), b"r\0a".to_vec())).unwrap(),
+        );
+
+        // Delete all
+        for kv in &test_data {
+            storage.raw_delete(
+                ctx.clone(),
+                "".to_string(),
+                kv.0.to_vec(),
+                expect_ok_callback(tx.clone(), 1),
+            ).unwrap();
+            rx.recv().unwrap();
+        }
+
+        // Assert now no key remains
+        for kv in &test_data {
+            expect_none(
+                block_on(storage.raw_get(ctx.clone(), "".to_string(), kv.0.to_vec())).unwrap(),
+            );
+        }
+
+        rx.recv().unwrap();
     }
 
     #[test]

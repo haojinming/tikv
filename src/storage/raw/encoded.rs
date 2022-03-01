@@ -7,9 +7,9 @@ use crate::storage::Statistics;
 use api_version::APIVersion;
 use kvproto::kvrpcpb::ApiVersion;
 use engine_traits::raw_ttl::ttl_current_ts;
-use engine_traits::{CfName, IterOptions, ReadOptions};
+use engine_traits::{CfName, IterOptions, ReadOptions, DATA_KEY_PREFIX_LEN};
 use std::marker::PhantomData;
-use txn_types::{Key, Value};
+use txn_types::{Key, Value, TimeStamp};
 
 #[derive(Clone)]
 pub struct RawEncodeSnapshot<S: Snapshot, API: APIVersion> {
@@ -36,6 +36,9 @@ impl<S: Snapshot, API: APIVersion> RawEncodeSnapshot<S, API> {
                     .map(|expire_ts| expire_ts <= self.current_ts)
                     .unwrap_or(false)
                 {
+                    return Ok(None);
+                }
+                if raw_value.is_delete.map_or(false, |is_delete| is_delete) {
                     return Ok(None);
                 }
                 Ok(Some(raw_value.user_value))
@@ -78,16 +81,18 @@ impl<S: Snapshot, API: APIVersion> RawEncodeSnapshot<S, API> {
         iter_opt.set_fill_cache(opts.map_or(true, |v| v.fill_cache()));
         iter_opt.use_prefix_seek();
         iter_opt.set_prefix_same_as_start(true);
+        let end_key = key.clone().append_ts(TimeStamp::zero());
+        iter_opt.set_upper_bound(end_key.as_encoded(), DATA_KEY_PREFIX_LEN);
         let mut iter = match cf {
             Some(cf_name) => self.iter_cf(cf_name, iter_opt)?,
             None => self.iter(iter_opt)?,
         };
         if !iter.seek(key)? {
-            Ok(Some(vec![]))
+            Ok(None)
         } else if iter.valid()? {
             Ok(Some(iter.value_with_ttl().to_owned()))
         } else {
-            Ok(Some(vec![]))
+            Ok(None)
         }
     }
 }
