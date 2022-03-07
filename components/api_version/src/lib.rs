@@ -24,15 +24,20 @@ pub trait APIVersion: Clone + Copy + 'static + Send + Sync {
     fn decode_raw_value(bytes: &[u8]) -> Result<RawValue<&[u8]>>;
     /// This is equivalent to `decode_raw_value()` but returns the owned user value.
     fn decode_raw_value_owned(mut bytes: Vec<u8>) -> Result<RawValue<Vec<u8>>> {
-        let (len, expire_ts) = {
+        let (len, expire_ts, is_delete) = {
             let raw_value = Self::decode_raw_value(&bytes)?;
-            (raw_value.user_value.len(), raw_value.expire_ts)
+            (
+                raw_value.user_value.len(),
+                raw_value.expire_ts,
+                raw_value.is_delete,
+            )
         };
         // The user value are always the first part in encoded bytes.
         bytes.truncate(len);
         Ok(RawValue {
             user_value: bytes,
             expire_ts,
+            is_delete,
         })
     }
     /// Encode the raw value and it's metadata into bytes.
@@ -149,6 +154,8 @@ pub struct RawValue<T: AsRef<[u8]>> {
     pub user_value: T,
     /// The unix timestamp in seconds indicating the point of time that this key will be deleted.
     pub expire_ts: Option<u64>,
+    /// Logical deletion flag in APIV2, should be `false` in APIV1 and APIV1TTL
+    pub is_delete: bool,
 }
 
 #[cfg(test)]
@@ -265,7 +272,7 @@ mod tests {
     }
 
     #[test]
-    fn test_no_ttl() {
+    fn test_no_meta() {
         // (user_value, encoded_bytes_V1, encoded_bytes_V1ttl, encoded_bytes_V2)
         let cases = vec![
             (&b""[..], &b""[..], &[0, 0, 0, 0, 0, 0, 0, 0][..], &[0][..]),
@@ -277,13 +284,13 @@ mod tests {
             ),
         ];
         for case in &cases {
-            assert_raw_value_encode_decode_identity(case.0, None, case.1, ApiVersion::V1);
+            assert_raw_value_encode_decode_identity(case.0, None, case.1, ApiVersion::V1, false);
         }
         for case in &cases {
-            assert_raw_value_encode_decode_identity(case.0, None, case.2, ApiVersion::V1ttl);
+            assert_raw_value_encode_decode_identity(case.0, None, case.2, ApiVersion::V1ttl, false);
         }
         for case in &cases {
-            assert_raw_value_encode_decode_identity(case.0, None, case.3, ApiVersion::V2);
+            assert_raw_value_encode_decode_identity(case.0, None, case.3, ApiVersion::V2, false);
         }
     }
 
@@ -311,10 +318,46 @@ mod tests {
                 Some(case.1),
                 case.2,
                 ApiVersion::V1ttl,
+                false,
             );
         }
         for case in &cases {
-            assert_raw_value_encode_decode_identity(case.0, Some(case.1), case.3, ApiVersion::V2);
+            assert_raw_value_encode_decode_identity(
+                case.0,
+                Some(case.1),
+                case.3,
+                ApiVersion::V2,
+                false,
+            );
+        }
+    }
+
+    #[test]
+    fn test_meta() {
+        // (user_value, expire_ts, ecoded_bytes_v2, is_delete)
+        let cases = vec![
+            // only deletion flag.
+            (&b""[..], None, &[2][..], true),
+            (&b""[..], None, &[0][..], false),
+            // deletion flag with value.
+            (&b""[..], Some(2), &[0, 0, 0, 0, 0, 0, 0, 2, 3][..], true),
+            (
+                &b"a"[..],
+                Some(2),
+                &[b'a', 0, 0, 0, 0, 0, 0, 0, 2, 3][..],
+                true,
+            ),
+            (&b""[..], Some(2), &[0, 0, 0, 0, 0, 0, 0, 2, 1][..], false),
+            (
+                &b"a"[..],
+                Some(2),
+                &[b'a', 0, 0, 0, 0, 0, 0, 0, 2, 1][..],
+                false,
+            ),
+        ];
+
+        for case in cases {
+            assert_raw_value_encode_decode_identity(case.0, case.1, case.2, ApiVersion::V2, case.3);
         }
     }
 
@@ -331,8 +374,8 @@ mod tests {
             (vec![1], ApiVersion::V2),
             (vec![1, 2, 3, 4, 5, 6, 7, 1], ApiVersion::V2),
             // Undefined flag.
-            (vec![2], ApiVersion::V2),
-            (vec![1, 2, 3, 4, 5, 6, 7, 8, 2], ApiVersion::V2),
+            (vec![4], ApiVersion::V2),
+            (vec![1, 2, 3, 4, 5, 6, 7, 8, 4], ApiVersion::V2),
         ];
 
         for (bytes, api_version) in cases {
@@ -353,6 +396,7 @@ mod tests {
         expire_ts: Option<u64>,
         encoded_bytes: &[u8],
         api_version: ApiVersion,
+        is_delete: bool,
     ) {
         match_template_api_version!(
             API,
@@ -361,6 +405,7 @@ mod tests {
                     let raw_value = RawValue {
                         user_value,
                         expire_ts,
+                        is_delete,
                     };
                     assert_eq!(&API::encode_raw_value(raw_value), encoded_bytes);
                     assert_eq!(API::decode_raw_value(encoded_bytes).unwrap(), raw_value);
@@ -368,6 +413,7 @@ mod tests {
                     let raw_value = RawValue {
                         user_value: user_value.to_vec(),
                         expire_ts,
+                        is_delete,
                     };
                     assert_eq!(
                         API::encode_raw_value_owned(raw_value.clone()),
