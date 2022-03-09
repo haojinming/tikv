@@ -8734,7 +8734,7 @@ mod tests {
             ..Default::default()
         };
 
-        let raw_test_data = vec![
+        let test_data = vec![
             (b"r\0a".to_vec(), b"aa".to_vec(), 10),
             (b"r\0aa".to_vec(), b"aaa".to_vec(), 20),
             (b"r\0b".to_vec(), b"bb".to_vec(), 30),
@@ -8749,16 +8749,6 @@ mod tests {
             (b"r\0cc".to_vec(), b"n_ccc".to_vec(), 120),
         ];
 
-        let test_data: Vec<(Vec<u8>, Vec<u8>, u64)> = raw_test_data
-            .into_iter()
-            .map(|(key, val, ts)| {
-                (
-                    APIV2::encode_raw_key_owned(key, Some(TimeStamp::from(ts))).into_encoded(),
-                    val,
-                    ts,
-                )
-            })
-            .collect();
         let ttl = 30;
         // Write key-value pairs one by one
         for (key, value, _) in test_data.clone() {
@@ -8793,6 +8783,13 @@ mod tests {
             iter.next().unwrap();
         }
 
+        let decoded_pairs: Vec<(Vec<u8>, Vec<u8>)> = pairs.into_iter()
+            .map(|(key, value)| {
+                let (user_key, _) = APIV2::decode_raw_key_owned(Key::from_encoded(key), true).unwrap();
+                (user_key, value)
+            })
+            .collect();
+
         let ret_data: Vec<(Vec<u8>, Vec<u8>)> = test_data
             .clone()
             .into_iter()
@@ -8800,20 +8797,26 @@ mod tests {
             .map(|(key, val, _)| (key, val))
             .collect();
 
-        assert_eq!(pairs, ret_data);
+        assert_eq!(decoded_pairs, ret_data);
         let raw_key = APIV2::encode_raw_key_owned(b"r\0z".to_vec(), None);
         iter.seek_for_prev(&raw_key).unwrap();
-        pairs.clear();
+        let mut pairs = vec![];
         while iter.valid().unwrap() {
             pairs.push((iter.key().to_owned(), iter.value().to_owned()));
             iter.prev().unwrap();
         }
+        let decoded_pairs: Vec<(Vec<u8>, Vec<u8>)> = pairs.into_iter()
+            .map(|(key, value)| {
+                let (user_key, _) = APIV2::decode_raw_key_owned(Key::from_encoded(key), true).unwrap();
+                (user_key, value)
+            })
+            .collect();
         let ret_data: Vec<(Vec<u8>, Vec<u8>)> = test_data
             .into_iter()
             .skip(6)
             .rev()
             .map(|(key, val, _)| (key, val))
             .collect();
-        assert_eq!(pairs, ret_data);
+        assert_eq!(decoded_pairs, ret_data);
     }
 }
