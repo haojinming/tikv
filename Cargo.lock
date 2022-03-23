@@ -371,6 +371,7 @@ dependencies = [
 name = "backup"
 version = "0.0.1"
 dependencies = [
+ "api_version",
  "async-channel",
  "collections",
  "concurrency_manager",
@@ -402,6 +403,7 @@ dependencies = [
  "slog",
  "slog-global",
  "tempfile",
+ "test_util",
  "thiserror",
  "tidb_query_common",
  "tikv",
