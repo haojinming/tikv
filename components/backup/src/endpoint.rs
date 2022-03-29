@@ -506,7 +506,7 @@ impl BackupRange {
                         self.convert_to_dest_value(value),
                     )));
                 };
-                info!("backup raw key";
+                debug!("backup raw key";
                     "key" => &log_wrappers::Value::key(key),
                     "value" => &log_wrappers::Value::value(value),
                     "valid" => is_valid,
