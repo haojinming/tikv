@@ -22,7 +22,8 @@ use kvproto::metapb::*;
 use online_config::OnlineConfig;
 
 use api_version::{
-    api_v2::RAW_KEY_PREFIX, match_template_api_version, APIVersion, RawValue, APIV1TTL, APIV2,
+    api_v2::RAW_KEY_PREFIX, match_template_api_version, APIVersion, KeyMode, RawValue, APIV1TTL,
+    APIV2,
 };
 use raft::StateRole;
 use raftstore::coprocessor::RegionInfoProvider;
@@ -425,14 +426,19 @@ impl BackupRange {
         Ok(stat)
     }
 
-    fn is_value_valid(&self, value: &[u8]) -> bool {
+    fn is_valid_raw_value(&self, key: &[u8], value: &[u8]) -> bool {
         if !self.is_raw_kv {
-            return true;
+            return false;
         }
+        if self.cur_api_version == ApiVersion::V2 {}
         match_template_api_version!(
             API,
             match self.cur_api_version {
                 ApiVersion::API => {
+                    let key_mode = API::parse_key_mode(key);
+                    if key_mode != KeyMode::Raw && key_mode != KeyMode::Unknown {
+                        return false;
+                    }
                     let raw_value = API::decode_raw_value(value).expect("invalid value");
                     return raw_value.is_valid(ttl_current_ts());
                 }
@@ -440,7 +446,7 @@ impl BackupRange {
         );
     }
 
-    fn convert_to_dest_key(&self, key: &[u8]) -> Vec<u8> {
+    fn convert_to_dest_raw_key(&self, key: &[u8]) -> Vec<u8> {
         if self.cur_api_version == self.dest_api_version {
             return key.to_owned();
         } else if (self.cur_api_version == ApiVersion::V1
@@ -458,7 +464,7 @@ impl BackupRange {
         panic!("Unexpected api version")
     }
 
-    fn convert_to_dest_value(&self, value: &[u8]) -> Vec<u8> {
+    fn convert_to_dest_raw_value(&self, value: &[u8]) -> Vec<u8> {
         if self.cur_api_version == self.dest_api_version {
             return value.to_owned();
         } else if self.cur_api_version == ApiVersion::V1ttl
@@ -503,11 +509,11 @@ impl BackupRange {
             while cursor.valid()? && batch.len() < BACKUP_BATCH_LIMIT {
                 let key = cursor.key(cfstatistics);
                 let value = cursor.value(cfstatistics);
-                let is_valid = self.is_value_valid(value);
+                let is_valid = self.is_valid_raw_value(key, value);
                 if is_valid {
                     batch.push(Ok((
-                        self.convert_to_dest_key(cursor.key(cfstatistics)),
-                        self.convert_to_dest_value(value),
+                        self.convert_to_dest_raw_key(cursor.key(cfstatistics)),
+                        self.convert_to_dest_raw_value(value),
                     )));
                 };
                 debug!("backup raw key";
