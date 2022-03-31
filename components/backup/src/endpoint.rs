@@ -50,6 +50,7 @@ use crate::Error;
 use crate::*;
 
 const BACKUP_BATCH_LIMIT: usize = 1024;
+const BACKUP_V1_TO_V2_TS: u64 = 1;
 
 #[derive(Clone)]
 struct Request {
@@ -448,8 +449,11 @@ impl BackupRange {
         {
             let mut apiv2_key = key.to_owned();
             apiv2_key.insert(0, RAW_KEY_PREFIX);
-            // TODO: should not use max timestamp, use CausalTsProvider to get current ts.
-            return APIV2::encode_raw_key_owned(apiv2_key, Some(TimeStamp::zero())).into_encoded();
+            return APIV2::encode_raw_key_owned(
+                apiv2_key,
+                Some(TimeStamp::from(BACKUP_V1_TO_V2_TS)),
+            )
+            .into_encoded();
         }
         panic!("Unexpected api version")
     }
