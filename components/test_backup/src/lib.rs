@@ -99,7 +99,7 @@ impl TestSuite {
         let mut tmp_value = String::from("foo").into_bytes();
         tmp_value.encode_u64(u64::MAX).unwrap();
         tmp_value.push(0);
-        cluster.must_put(b"rfoo", &tmp_value); // make raw apiv1ttl/apiv2 encode happy.
+        cluster.must_put(b"foo", &tmp_value); // make raw apiv1ttl/apiv2 encode happy.
         let region_id = 1;
         let leader = cluster.leader_of_region(region_id).unwrap();
         let leader_addr = cluster.sim.rl().get_addr(leader.get_store_id());

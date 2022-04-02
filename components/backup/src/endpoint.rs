@@ -446,32 +446,35 @@ impl BackupRange {
         );
     }
 
-    fn convert_to_dest_raw_key(&self, key: &[u8]) -> Vec<u8> {
+    fn convert_to_dest_raw_key(&self, key: &[u8]) -> Result<Vec<u8>> {
         if self.cur_api_version == self.dest_api_version {
-            return key.to_owned();
+            return Ok(key.to_owned());
         } else if (self.cur_api_version == ApiVersion::V1
             || self.cur_api_version == ApiVersion::V1ttl)
             && self.dest_api_version == ApiVersion::V2
         {
             let mut apiv2_key = key.to_owned();
             apiv2_key.insert(0, RAW_KEY_PREFIX);
-            return APIV2::encode_raw_key_owned(
+            return Ok(APIV2::encode_raw_key_owned(
                 apiv2_key,
                 Some(TimeStamp::from(BACKUP_V1_TO_V2_TS)),
             )
-            .into_encoded();
+            .into_encoded());
         }
-        panic!("Unexpected api version")
+        Err(Error::ApiVersionNotMatched {
+            cur_api_ver: self.cur_api_version as i32,
+            dest_api_ver: self.dest_api_version as i32,
+        })
     }
 
-    fn convert_to_dest_raw_value(&self, value: &[u8]) -> Vec<u8> {
+    fn convert_to_dest_raw_value(&self, value: &[u8]) -> Result<Vec<u8>> {
         if self.cur_api_version == self.dest_api_version {
-            return value.to_owned();
+            return Ok(value.to_owned());
         } else if self.cur_api_version == ApiVersion::V1ttl
             && self.dest_api_version == ApiVersion::V2
         {
             let raw_value = APIV1TTL::decode_raw_value(value).expect("invalid v1ttl value");
-            return APIV2::encode_raw_value(raw_value);
+            return Ok(APIV2::encode_raw_value(raw_value));
         } else if self.cur_api_version == ApiVersion::V1 && self.dest_api_version == ApiVersion::V2
         {
             let raw_value = RawValue {
@@ -479,9 +482,12 @@ impl BackupRange {
                 expire_ts: None,
                 is_delete: false,
             };
-            return APIV2::encode_raw_value_owned(raw_value);
+            return Ok(APIV2::encode_raw_value_owned(raw_value));
         }
-        panic!("Unexpected api version")
+        Err(Error::ApiVersionNotMatched {
+            cur_api_ver: self.cur_api_version as i32,
+            dest_api_ver: self.dest_api_version as i32,
+        })
     }
 
     fn backup_raw<S: Snapshot>(
@@ -512,13 +518,13 @@ impl BackupRange {
                 let is_valid = self.is_valid_raw_value(key, value);
                 if is_valid {
                     batch.push(Ok((
-                        self.convert_to_dest_raw_key(cursor.key(cfstatistics)),
-                        self.convert_to_dest_raw_value(value),
+                        self.convert_to_dest_raw_key(key)?,
+                        self.convert_to_dest_raw_value(value)?,
                     )));
                 };
-                debug!("backup raw key";
-                    "key" => &log_wrappers::Value::key(key),
-                    "value" => &log_wrappers::Value::value(value),
+                info!("backup raw key";
+                    "key" => &log_wrappers::Value::key(&self.convert_to_dest_raw_key(key)?),
+                    "value" => &log_wrappers::Value::value(&self.convert_to_dest_raw_value(value)?),
                     "valid" => is_valid,
                 );
                 cursor.next(cfstatistics);
