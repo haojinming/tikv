@@ -436,7 +436,6 @@ fn test_backup_rawkv_v2() {
     test_backup_rawkv_impl(ApiVersion::V2, ApiVersion::V2)
 }
 
-
 fn test_backup_rawkv_convert_impl(cur_api_ver: ApiVersion, dst_api_ver: ApiVersion) {
     let suite = TestSuite::new(3, 144 * 1024 * 1024, cur_api_ver);
     let key_count = 60;

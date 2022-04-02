@@ -118,8 +118,8 @@ pub enum Error {
     Semaphore(#[from] AcquireError),
     #[error("Channel is closed")]
     ChannelClosed,
-    #[error("ApiVersion not match, current {cur_api_ver}, dest {dest_api_ver}")]
-    ApiVersionNotMatched { cur_api_ver: i32, dest_api_ver: i32 },
+    #[error("Convert fails, current {cur_api_ver}, dest {dest_api_ver}")]
+    ApiConvertFail { cur_api_ver: i32, dest_api_ver: i32 },
 }
 
 macro_rules! impl_from {

@@ -22,8 +22,7 @@ use kvproto::metapb::*;
 use online_config::OnlineConfig;
 
 use api_version::{
-    api_v2::RAW_KEY_PREFIX, match_template_api_version, APIVersion, KeyMode, RawValue, APIV1TTL,
-    APIV2,
+    convert_raw_key, convert_raw_value, match_template_api_version, APIVersion, KeyMode,
 };
 use raft::StateRole;
 use raftstore::coprocessor::RegionInfoProvider;
@@ -446,48 +445,43 @@ impl BackupRange {
         );
     }
 
-    fn convert_to_dest_raw_key(&self, key: &[u8]) -> Result<Vec<u8>> {
-        if self.cur_api_version == self.dest_api_version {
-            return Ok(key.to_owned());
-        } else if (self.cur_api_version == ApiVersion::V1
-            || self.cur_api_version == ApiVersion::V1ttl)
-            && self.dest_api_version == ApiVersion::V2
-        {
-            let mut apiv2_key = key.to_owned();
-            apiv2_key.insert(0, RAW_KEY_PREFIX);
-            return Ok(APIV2::encode_raw_key_owned(
-                apiv2_key,
-                Some(TimeStamp::from(BACKUP_V1_TO_V2_TS)),
-            )
-            .into_encoded());
+    fn convert_to_dest_raw_key(&self, key: &[u8]) -> Result<Key> {
+        if let Ok(dest_key) = convert_raw_key(
+            key,
+            self.cur_api_version,
+            self.dest_api_version,
+            Some(TimeStamp::from(BACKUP_V1_TO_V2_TS)),
+        ) {
+            return Ok(dest_key);
+        } else {
+            error!("convert raw key fails";
+                "key" => &log_wrappers::Value::key(key),
+                "cur_api_version" => self.cur_api_version as i32,
+                "dest_api_version" => self.dest_api_version as i32,
+            );
+            return Err(Error::ApiConvertFail {
+                cur_api_ver: self.cur_api_version as i32,
+                dest_api_ver: self.dest_api_version as i32,
+            });
         }
-        Err(Error::ApiVersionNotMatched {
-            cur_api_ver: self.cur_api_version as i32,
-            dest_api_ver: self.dest_api_version as i32,
-        })
     }
 
     fn convert_to_dest_raw_value(&self, value: &[u8]) -> Result<Vec<u8>> {
-        if self.cur_api_version == self.dest_api_version {
-            return Ok(value.to_owned());
-        } else if self.cur_api_version == ApiVersion::V1ttl
-            && self.dest_api_version == ApiVersion::V2
+        if let Ok(dest_value) =
+            convert_raw_value(value, self.cur_api_version, self.dest_api_version)
         {
-            let raw_value = APIV1TTL::decode_raw_value(value).expect("invalid v1ttl value");
-            return Ok(APIV2::encode_raw_value(raw_value));
-        } else if self.cur_api_version == ApiVersion::V1 && self.dest_api_version == ApiVersion::V2
-        {
-            let raw_value = RawValue {
-                user_value: value.to_owned(),
-                expire_ts: None,
-                is_delete: false,
-            };
-            return Ok(APIV2::encode_raw_value_owned(raw_value));
+            return Ok(dest_value);
+        } else {
+            error!("convert raw value fails";
+                "value" => &log_wrappers::Value::key(value),
+                "cur_api_version" => self.cur_api_version as i32,
+                "dest_api_version" => self.dest_api_version as i32,
+            );
+            return Err(Error::ApiConvertFail {
+                cur_api_ver: self.cur_api_version as i32,
+                dest_api_ver: self.dest_api_version as i32,
+            });
         }
-        Err(Error::ApiVersionNotMatched {
-            cur_api_ver: self.cur_api_version as i32,
-            dest_api_ver: self.dest_api_version as i32,
-        })
     }
 
     fn backup_raw<S: Snapshot>(
@@ -518,13 +512,13 @@ impl BackupRange {
                 let is_valid = self.is_valid_raw_value(key, value);
                 if is_valid {
                     batch.push(Ok((
-                        self.convert_to_dest_raw_key(key)?,
+                        self.convert_to_dest_raw_key(key)?.into_encoded(),
                         self.convert_to_dest_raw_value(value)?,
                     )));
                 };
                 info!("backup raw key";
-                    "key" => &log_wrappers::Value::key(&self.convert_to_dest_raw_key(key)?),
-                    "value" => &log_wrappers::Value::value(&self.convert_to_dest_raw_value(value)?),
+                    "key" => &log_wrappers::Value::key(key),
+                    "value" => &log_wrappers::Value::value(value),
                     "valid" => is_valid,
                 );
                 cursor.next(cfstatistics);
@@ -1195,6 +1189,7 @@ pub mod tests {
     use std::path::{Path, PathBuf};
     use std::time::Duration;
 
+    use api_version::{api_v2::RAW_KEY_PREFIX, RawValue};
     use engine_traits::MiscExt;
     use external_storage_export::{make_local_backend, make_noop_backend};
     use file_system::{IOOp, IORateLimiter, IOType};
