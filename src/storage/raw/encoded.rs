@@ -13,7 +13,7 @@ use txn_types::{Key, Value};
 
 #[derive(Clone)]
 pub struct RawEncodeSnapshot<S: Snapshot, API: APIVersion> {
-    snap: S,
+    pub snap: S,
     current_ts: u64,
     _phantom: PhantomData<API>,
 }
