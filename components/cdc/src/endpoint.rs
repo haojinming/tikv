@@ -371,6 +371,14 @@ impl ResolvedRegionVec {
             {
                 return Some(first_resolved_region.to_owned());
             }
+            info!{"get_extreme_outlier raw region ts does not match the condition"; 
+                "raw_region_cnt" => self.vec.len(),
+                "ts delta" => delta,
+                "min_region_ts" => ?first_resolved_region,
+            }
+        }
+        info!{"get_extreme_outlier raw region cnt is less than 10"; 
+            "raw_region_cnt" => self.vec.len(),
         }
         None
     }
@@ -832,6 +840,9 @@ impl<T: 'static + RaftStoreRouter<E>, E: KvEngine> Endpoint<T, E> {
             let mut deregister = None;
             if let Some(delegate) = self.capture_regions.get_mut(&region_id) {
                 if delegate.has_failed() {
+                    info!("on multi batch is droped because failed";
+                        "region_id" => region_id,
+                    );
                     // Skip the batch if the delegate has failed.
                     continue;
                 }
@@ -950,7 +961,7 @@ impl<T: 'static + RaftStoreRouter<E>, E: KvEngine> Endpoint<T, E> {
                     resolved_regions.push(region_id, resolved_ts.min());
                     // The judge of raw region is not accuracy here, and we may miss at most one
                     // "normal" raw region. But this will not break the correctness of outlier detection.
-                    if resolved_ts.is_min_ts_from_raw() {
+                    if resolved_ts.is_min_ts_from_raw() || delegate.is_raw_region() {
                         raw_resolved_regions.push(region_id, resolved_ts.raw_ts)
                     }
 

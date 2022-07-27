@@ -97,6 +97,11 @@ impl<Ts: CausalTsProvider, Tk: RawTsTracker> QueryObserver for CausalObserver<Ts
                 ts = Some(self.causal_ts_provider.get_ts().map_err(|err| {
                     coprocessor::Error::Other(box_err!("Get causal timestamp error: {:?}", err))
                 })?);
+                debug!("track raw ts";
+                    "region_id" => region_id,
+                    "ts" => ts,
+                    "req" => ?req,
+                );
                 // use prev ts as `resolved_ts` means the data with smaller or equal ts has already sink to cdc.
                 self.ts_tracker
                     .track_ts(region_id, ts.unwrap().prev())

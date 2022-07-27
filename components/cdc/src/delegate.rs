@@ -8,7 +8,6 @@ use std::{
         Arc,
     },
 };
-
 use api_version::{ApiV2, KeyMode, KvFormat};
 use collections::{HashMap, HashMapEntry};
 use crossbeam::atomic::AtomicCell;
@@ -222,6 +221,7 @@ impl Drop for Pending {
     }
 }
 
+#[derive(Debug)]
 enum PendingLock {
     Track { key: Vec<u8>, start_ts: TimeStamp },
     Untrack { key: Vec<u8> },
@@ -391,6 +391,10 @@ impl Delegate {
         info!("cdc region is ready"; "region_id" => self.region_id);
 
         for lock in mem::take(&mut pending.locks) {
+            info!{"scan pending lock";
+                "region_id" => self.region_id,
+                "lock" => ?lock,
+            };
             match lock {
                 PendingLock::Track { key, start_ts } => resolver.track_lock(start_ts, key, None),
                 PendingLock::Untrack { key } => resolver.untrack_lock(&key, None),
@@ -420,7 +424,7 @@ impl Delegate {
         debug!("cdc try to advance ts"; "region_id" => self.region_id, "min_ts" => min_ts);
         let resolver = self.resolver.as_mut().unwrap();
         let resolved_ts = resolver.resolve(min_ts);
-        debug!("cdc resolved ts updated";
+        info!("cdc resolved ts updated";
             "region_id" => self.region_id, "resolved_ts" => ?resolved_ts);
         CDC_RESOLVED_TS_GAP_HISTOGRAM
             .observe((min_ts.physical() - resolved_ts.min().physical()) as f64 / 1000f64);
@@ -436,6 +440,11 @@ impl Delegate {
     ) -> Result<()> {
         // Stale CmdBatch, drop it silently.
         if batch.cdc_id != self.handle.id {
+            info!("on batch is drooped";
+                "region_id" => self.region_id,
+                "bacth cdc id" => ?batch.cdc_id,
+                "self handle id" => ?self.handle.id,
+            );
             return Ok(());
         }
         for cmd in batch.into_iter(self.region_id) {
@@ -448,6 +457,9 @@ impl Delegate {
             if response.get_header().has_error() {
                 let err_header = response.mut_header().take_error();
                 self.mark_failed();
+                info!("on batch response has err";
+                    "region_id" => self.region_id,
+                );
                 return Err(Error::request(err_header));
             }
             if !request.has_admin_request() {
@@ -462,6 +474,10 @@ impl Delegate {
                     is_one_pc,
                 )?;
             } else {
+                info!("sink admin request";
+                    "region_id" => self.region_id,
+                    "has put request" => request.get_requests().len(),
+                );
                 self.sink_admin(request.take_admin_request(), response.take_admin_response())?;
             }
         }
@@ -614,14 +630,15 @@ impl Delegate {
 
     fn sink_raw_downstream(&mut self, entries: Vec<EventRow>, index: u64) -> Result<()> {
         if entries.is_empty() {
+            info!("sink entry is empty"; "region_id" => self.region_id);
             return Ok(());
         }
         // the entry's timestamp is non-decreasing, the last has the max ts.
-        let max_raw_ts = TimeStamp::from(entries.last().unwrap().commit_ts);
+        let max_raw_ts = TimeStamp::from(entries.last().unwrap().commit_ts).prev();
         match self.resolver {
             Some(ref mut resolver) => {
                 // use prev ts, see reason at CausalObserver::pre_propose_query
-                resolver.raw_untrack_lock(max_raw_ts.prev());
+                resolver.raw_untrack_lock(max_raw_ts);
             }
             None => {
                 assert!(self.pending.is_some(), "region resolver not ready");
@@ -635,6 +652,16 @@ impl Delegate {
     }
 
     pub fn raw_track_ts(&mut self, ts: TimeStamp) {
+        // let mut initialized = false;
+        // for downstream in self.downstreams() {
+        //     if downstream.state.load().ready_for_change_events() {
+        //         initialized = true;
+        //         break;
+        //     }
+        // }
+        // if !initialized {
+        //     return;
+        // }
         match self.resolver {
             Some(ref mut resolver) => {
                 resolver.raw_track_lock(ts);
@@ -902,6 +929,16 @@ impl Delegate {
         self.handle.stop_observing();
         // To inform transaction layer no more old values are required for the region.
         self.txn_extra_op.store(TxnExtraOp::Noop);
+    }
+
+    // if raw data and tidb data both exist in this region, it will return false.
+    pub fn is_raw_region(&self) -> bool {
+        if let Some(region) = &self.region {
+            if ApiV2::parse_range_mode((Some(&region.start_key), Some(&region.end_key))) == KeyMode::Raw {
+                return true;
+            }
+        }
+        return false;
     }
 }
 

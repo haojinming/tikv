@@ -10,7 +10,7 @@ use kvproto::metapb::{Peer, Region};
 use raft::StateRole;
 use raftstore::{coprocessor::*, store::RegionSnapshot, Error as RaftStoreError};
 use tikv::storage::Statistics;
-use tikv_util::{box_err, error, warn, worker::Scheduler};
+use tikv_util::{box_err, error, warn, info, debug, worker::Scheduler};
 use txn_types::TimeStamp;
 
 use crate::{
@@ -103,6 +103,10 @@ impl<E: KvEngine> CmdObserver<E> for CdcObserver {
         cmd_batches: &mut Vec<CmdBatch>,
         engine: &E,
     ) {
+        debug!("on_flush_applied_cmd_batch";
+            "max_level" => ?max_level,
+            "cmd_batches" => ?cmd_batches,
+        );
         assert!(!cmd_batches.is_empty());
         fail_point!("before_cdc_flush_apply");
         if max_level < ObserveLevel::All {

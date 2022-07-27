@@ -10,6 +10,7 @@ use std::{
 use collections::{HashMap, HashSet};
 use raftstore::store::RegionReadProgress;
 use txn_types::TimeStamp;
+use tikv_util::info;
 
 use crate::metrics::RTS_RESOLVED_FAIL_ADVANCE_VEC;
 
@@ -229,6 +230,13 @@ impl Resolver {
             .map_or(min_ts, |ts| ts.to_owned().0);
         // Resolved ts never decrease.
         self.resolved_ts.raw_ts = cmp::max(self.resolved_ts.raw_ts, min_raw_ts);
+        info!("resolve ts";
+            "region_id" => self.region_id,
+            "min_raw_ts" => min_raw_ts,
+            "raw_resolved_ts" => self.resolved_ts.raw_ts,
+            "txn_resolved_ts" => self.resolved_ts.txn_ts,
+            "raw_lock_heap_size" => self.raw_lock_ts_heap.len(),
+        );
 
         let new_min_ts = if has_lock {
             // If there are some lock, the min_ts must be smaller than
