@@ -15,7 +15,7 @@ use kvproto::{
 use raft::StateRole;
 use raftstore::{coprocessor::*, store::RegionSnapshot, Error as RaftStoreError};
 use tikv::storage::Statistics;
-use tikv_util::{box_err, defer, error, warn, worker::Scheduler};
+use tikv_util::{box_err, defer, error, warn, info, worker::Scheduler};
 use txn_types::{Key, TimeStamp};
 
 use crate::{
@@ -111,6 +111,8 @@ impl CdcObserver {
         if raw_region_ts.is_empty() {
             return;
         }
+        info!("cdc schedule raw untrack ts task";
+                    "raw_region_ts" => ?raw_region_ts);
         if let Err(e) = self.sched.schedule(Task::RawUntrackTs { raw_region_ts }) {
             warn!("cdc schedule task failed"; "error" => ?e);
         }

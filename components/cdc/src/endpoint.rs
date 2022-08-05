@@ -1021,6 +1021,10 @@ impl<T: 'static + RaftStoreRouter<E>, E: KvEngine> Endpoint<T, E> {
         let (normal_min_resolved_ts, normal_regions) = resolved_regions.to_hash_set();
         self.broadcast_resolved_ts(outlier_min_resolved_ts, outlier_regions);
         self.broadcast_resolved_ts(normal_min_resolved_ts, normal_regions);
+        info!("cdc broadcast resolved_ts.";
+            "outlier_min_resolved_ts" => outlier_min_resolved_ts,
+            "normal_min_resolved_ts" => normal_min_resolved_ts,
+            "min_ts" => min_ts);
 
         // rawkv only, if user does not use rawkv apiv2, raw_resolved_regions should be
         // empty.
@@ -1202,6 +1206,9 @@ impl<T: 'static + RaftStoreRouter<E>, E: KvEngine> Endpoint<T, E> {
                 };
 
             if !regions.is_empty() {
+                info!("cdc schedule min ts task";
+                    "min_ts" => min_ts, "min_ts_pd" => min_ts_pd,
+                    "min_ts_min_lock" => min_ts_min_lock);
                 match scheduler.schedule(Task::MinTs {
                     regions,
                     min_ts,
