@@ -90,6 +90,7 @@ impl<Ts: CausalTsProvider, Tk: RawTsTracker> QueryObserver for CausalObserver<Ts
     ) -> coprocessor::Result<()> {
         let region_id = ctx.region().get_id();
         let mut ts = None;
+        let mut track_ts = None;
 
         for req in requests.iter_mut().filter(|r| {
             r.get_cmd_type() == CmdType::Put
@@ -99,6 +100,7 @@ impl<Ts: CausalTsProvider, Tk: RawTsTracker> QueryObserver for CausalObserver<Ts
                 ts = Some(self.causal_ts_provider.get_ts().map_err(|err| {
                     coprocessor::Error::Other(box_err!("Get causal timestamp error: {:?}", err))
                 })?);
+                track_ts = ts;
                 // use prev ts as `resolved_ts` means the data with smaller or equal ts has
                 // already sink to cdc.
                 self.ts_tracker
@@ -106,11 +108,18 @@ impl<Ts: CausalTsProvider, Tk: RawTsTracker> QueryObserver for CausalObserver<Ts
                     .map_err(|err| {
                         coprocessor::Error::Other(box_err!("track ts err: {:?}", err))
                     })?;
+
+                ts = Some(self.causal_ts_provider.get_ts().map_err(|err| {
+                    coprocessor::Error::Other(box_err!("Get causal timestamp error: {:?}", err))
+                })?);
             }
 
             ApiV2::append_ts_on_encoded_bytes(req.mut_put().mut_key(), ts.unwrap());
-            trace!("CausalObserver::pre_propose_query, append_ts"; "region_id" => region_id,
-                "key" => &log_wrappers::Value::key(req.get_put().get_key()), "ts" => ?ts.unwrap());
+            info!("CausalObserver::pre_propose_query, append_ts"; "region_id" => region_id,
+                "key" => &log_wrappers::Value::key(req.get_put().get_key()), 
+                "append-ts" => ?ts.unwrap(), 
+                "track-ts" => ?track_ts.unwrap(),
+                "track-ts-prev" => ?track_ts.unwrap().prev());
         }
         Ok(())
     }
@@ -125,10 +134,18 @@ impl<Ts: CausalTsProvider, Tk: RawTsTracker> RoleObserver for CausalObserver<Ts,
         // This would lead to the late of flush, and violate causality. See issue
         // #12498. So we observe role change to Candidate to fix this issue.
         // Also note that when there is only one peer, it would become leader directly.
+        //
+        // region
+        // print ts
         if role_change.state == StateRole::Candidate
             || (ctx.region().peers.len() == 1 && role_change.state == StateRole::Leader)
         {
             self.flush_timestamp(ctx.region(), REASON_LEADER_TRANSFER);
+            let region_id = ctx.region().get_id();
+            let ts = self.causal_ts_provider.get_ts().map_err(|err| {
+                coprocessor::Error::Other(box_err!("Get causal timestamp error: {:?}", err))
+            });
+            info!("CausalObserver::one_role_change"; "region_id" => region_id, "ts" => ?ts);
         }
     }
 }
