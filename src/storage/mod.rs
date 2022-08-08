@@ -1452,6 +1452,25 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
         Ok(())
     }
 
+    pub fn sched_raw_command<T: StorageCallbackType>(
+        sched: TxnScheduler<E, L>,
+        cmd: TypedCommand<T>,
+        callback: Callback<T>,
+    ) -> Result<()> {
+        let cmd: Command = cmd.into();
+
+        with_tls_tracker(|tracker| {
+            tracker.req_info.start_ts = cmd.ts().into_inner();
+            tracker.req_info.request_type = cmd.request_type();
+        });
+
+        fail_point!("storage_drop_message", |_| Ok(()));
+        cmd.incr_cmd_metric();
+        sched.run_cmd(cmd, T::callback(callback));
+
+        Ok(())
+    }
+
     /// Delete all keys in the range [`start_key`, `end_key`).
     ///
     /// All keys in the range will be deleted permanently regardless of their
@@ -1803,6 +1822,19 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
         }
     }
 
+    async fn get_ts_from_provider(provider: Option<Arc<dyn CausalTsProvider>>) -> Result<Option<TimeStamp>> {
+        let mut ts = None;
+        if let Some(p) = provider {
+            let ret = p.get_ts_async().await;
+            if let Err(e) = ret {
+                return Err(box_err!("fail to get causal ts"));
+            } else {
+                ts = Some(ret.unwrap());
+            }
+        }
+        Ok(ts)
+    }
+
     /// Write a raw key to the storage.
     pub fn raw_put(
         &self,
@@ -1812,21 +1844,21 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
         value: Vec<u8>,
         ttl: u64,
         callback: Callback<()>,
-    ) -> impl Future<Output = Result<Option<Vec<u8>>>> {
+    ) -> impl Future<Output = Result<()>> {
         const CMD: CommandKind = CommandKind::raw_put;
         let api_version = self.api_version;
-        let provider = self.causal_ts_provider.clone().unwrap();
+        let provider = self.causal_ts_provider.clone();
         let engine = self.engine.clone();
 
         async move {
-            // Self::check_api_version(api_version, ctx.api_version, CMD, [&key])?;
+            Self::check_api_version(api_version, ctx.api_version, CMD, [&key])?;
 
-            // check_key_size!(Some(&key).into_iter(), self.max_key_size, callback);
+            //check_key_size!(Some(&key).into_iter(), self.max_key_size, callback);
 
-            // if !F::IS_TTL_ENABLED && ttl != 0 {
-            //     return Err(Error::from(ErrorInner::TtlNotEnabled));
-            // }
-            let ts = provider.get_ts_async().await.unwrap();
+            if !F::IS_TTL_ENABLED && ttl != 0 {
+                return Err(Error::from(ErrorInner::TtlNotEnabled));
+            }
+            let ts = Self::get_ts_from_provider(provider).await?;
             let raw_value = RawValue {
                 user_value: value,
                 expire_ts: ttl_to_expire_ts(ttl),
@@ -1834,23 +1866,20 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
             };
             let m = Modify::Put(
                 Self::rawkv_cf(&cf, api_version)?,
-                F::encode_raw_key_owned(key, Some(ts)),
+                F::encode_raw_key_owned(key, ts),
                 F::encode_raw_value_owned(raw_value),
             );
     
             let mut batch = WriteData::from_modifies(vec![m]);
             batch.set_allowed_on_disk_almost_full();
     
-            let async_ret = engine.async_write(
+            engine.async_write(
                 &ctx,
                 batch,
                 Box::new(|res| callback(res.map_err(Error::from))),
-            );
-            if async_ret.is_err() {
-                return Err(Error::from(ErrorInner::TtlNotEnabled));
-            }
+            )?;
             KV_COMMAND_COUNTER_VEC_STATIC.raw_put.inc();
-            Ok(Some(vec![0]))
+            Ok(())
         }
     }
 
@@ -1858,6 +1887,7 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
         cf: CfName,
         pairs: Vec<KvPair>,
         ttls: Vec<u64>,
+        ts: Option<TimeStamp>
     ) -> Result<Vec<Modify>> {
         if !F::IS_TTL_ENABLED {
             if ttls.iter().any(|&x| x != 0) {
@@ -1878,7 +1908,7 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
                 };
                 Modify::Put(
                     cf,
-                    F::encode_raw_key_owned(k, None),
+                    F::encode_raw_key_owned(k, ts),
                     F::encode_raw_value_owned(raw_value),
                 )
             })
@@ -1894,37 +1924,40 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
         pairs: Vec<KvPair>,
         ttls: Vec<u64>,
         callback: Callback<()>,
-    ) -> Result<()> {
-        Self::check_api_version(
-            self.api_version,
-            ctx.api_version,
-            CommandKind::raw_batch_put,
-            pairs.iter().map(|(ref k, _)| k),
-        )?;
+    ) -> impl Future<Output = Result<()>> {
 
-        let cf = Self::rawkv_cf(&cf, self.api_version)?;
-
-        check_key_size!(
-            pairs.iter().map(|(ref k, _)| k),
-            self.max_key_size,
-            callback
-        );
-
-        let modifies = Self::raw_batch_put_requests_to_modifies(cf, pairs, ttls)?;
-        let mut batch = WriteData::from_modifies(modifies);
-        batch.set_allowed_on_disk_almost_full();
-
-        self.engine.async_write(
-            &ctx,
-            batch,
-            Box::new(|res| callback(res.map_err(Error::from))),
-        )?;
-        KV_COMMAND_COUNTER_VEC_STATIC.raw_batch_put.inc();
-        Ok(())
+        // check_key_size!(
+        //     pairs.iter().map(|(ref k, _)| k),
+        //     self.max_key_size,
+        //     callback
+        // );
+        let api_version = self.api_version;
+        let engine = self.engine.clone();
+        let provider = self.causal_ts_provider.clone();
+        async move {
+            Self::check_api_version(
+                api_version,
+                ctx.api_version,
+                CommandKind::raw_batch_put,
+                pairs.iter().map(|(ref k, _)| k),
+            )?;
+            let cf = Self::rawkv_cf(&cf, api_version)?;
+            let ts = Self::get_ts_from_provider(provider).await?;
+            let modifies = Self::raw_batch_put_requests_to_modifies(cf, pairs, ttls, ts)?;
+            let mut batch = WriteData::from_modifies(modifies);
+            batch.set_allowed_on_disk_almost_full();
+            engine.async_write(
+                &ctx,
+                batch,
+                Box::new(|res| callback(res.map_err(Error::from))),
+            )?;
+            KV_COMMAND_COUNTER_VEC_STATIC.raw_batch_put.inc();
+            Ok(())
+        }
     }
 
-    fn raw_delete_request_to_modify(cf: CfName, key: Vec<u8>) -> Modify {
-        let key = F::encode_raw_key_owned(key, None);
+    fn raw_delete_request_to_modify(cf: CfName, key: Vec<u8>, ts: Option<TimeStamp>) -> Modify {
+        let key = F::encode_raw_key_owned(key, ts);
         match F::TAG {
             ApiVersion::V2 => Modify::Put(cf, key, ApiV2::ENCODED_LOGICAL_DELETE.to_vec()),
             _ => Modify::Delete(cf, key),
@@ -1940,27 +1973,32 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
         cf: String,
         key: Vec<u8>,
         callback: Callback<()>,
-    ) -> Result<()> {
-        Self::check_api_version(
-            self.api_version,
-            ctx.api_version,
-            CommandKind::raw_delete,
-            [&key],
-        )?;
+    ) -> impl Future<Output = Result<()>> {
 
-        check_key_size!(Some(&key).into_iter(), self.max_key_size, callback);
+        // check_key_size!(Some(&key).into_iter(), self.max_key_size, callback);
+        let api_version = self.api_version;
+        let engine = self.engine.clone();
+        let provider = self.causal_ts_provider.clone();
+        async move {
+            Self::check_api_version(
+                api_version,
+                ctx.api_version,
+                CommandKind::raw_delete,
+                [&key],
+            )?;
+            let ts = Self::get_ts_from_provider(provider).await?;
+            let m = Self::raw_delete_request_to_modify(Self::rawkv_cf(&cf, api_version)?, key, ts);
+            let mut batch = WriteData::from_modifies(vec![m]);
+            batch.set_allowed_on_disk_almost_full();
 
-        let m = Self::raw_delete_request_to_modify(Self::rawkv_cf(&cf, self.api_version)?, key);
-        let mut batch = WriteData::from_modifies(vec![m]);
-        batch.set_allowed_on_disk_almost_full();
-
-        self.engine.async_write(
-            &ctx,
-            batch,
-            Box::new(|res| callback(res.map_err(Error::from))),
-        )?;
-        KV_COMMAND_COUNTER_VEC_STATIC.raw_delete.inc();
-        Ok(())
+            engine.async_write(
+                &ctx,
+                batch,
+                Box::new(|res| callback(res.map_err(Error::from))),
+            )?;
+            KV_COMMAND_COUNTER_VEC_STATIC.raw_delete.inc();
+            Ok(())
+        }
     }
 
     /// Delete all raw keys in [`start_key`, `end_key`).
@@ -1974,32 +2012,38 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
         start_key: Vec<u8>,
         end_key: Vec<u8>,
         callback: Callback<()>,
-    ) -> Result<()> {
-        check_key_size!([&start_key, &end_key], self.max_key_size, callback);
-        Self::check_api_version_ranges(
-            self.api_version,
-            ctx.api_version,
-            CommandKind::raw_delete_range,
-            [(Some(&start_key), Some(&end_key))],
-        )?;
+    ) -> impl Future<Output = Result<()>> {
+        let api_version = self.api_version;
+        let engine = self.engine.clone();
+        let provider = self.causal_ts_provider.clone();
+        async move {
+            //check_key_size!([&start_key, &end_key], self.max_key_size, callback);
+            Self::check_api_version_ranges(
+                api_version,
+                ctx.api_version,
+                CommandKind::raw_delete_range,
+                [(Some(&start_key), Some(&end_key))],
+            )?;
 
-        let cf = Self::rawkv_cf(&cf, self.api_version)?;
-        let start_key = F::encode_raw_key_owned(start_key, None);
-        let end_key = F::encode_raw_key_owned(end_key, None);
+            let cf = Self::rawkv_cf(&cf, api_version)?;
+            let start_key = F::encode_raw_key_owned(start_key, None);
+            let end_key = F::encode_raw_key_owned(end_key, None);
 
-        let mut batch =
-            WriteData::from_modifies(vec![Modify::DeleteRange(cf, start_key, end_key, false)]);
-        batch.set_allowed_on_disk_almost_full();
+            let mut batch =
+                WriteData::from_modifies(vec![Modify::DeleteRange(cf, start_key, end_key, false)]);
+            batch.set_allowed_on_disk_almost_full();
 
-        // TODO: special notification channel for API V2.
+            // TODO: special notification channel for API V2.
 
-        self.engine.async_write(
-            &ctx,
-            batch,
-            Box::new(|res| callback(res.map_err(Error::from))),
-        )?;
-        KV_COMMAND_COUNTER_VEC_STATIC.raw_delete_range.inc();
-        Ok(())
+            engine.async_write(
+                &ctx,
+                batch,
+                Box::new(|res| callback(res.map_err(Error::from))),
+            )?;
+            KV_COMMAND_COUNTER_VEC_STATIC.raw_delete_range.inc();
+            Ok(())
+        }
+        
     }
 
     /// Delete some raw keys in a batch.
@@ -2011,31 +2055,36 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
         cf: String,
         keys: Vec<Vec<u8>>,
         callback: Callback<()>,
-    ) -> Result<()> {
-        Self::check_api_version(
-            self.api_version,
-            ctx.api_version,
-            CommandKind::raw_batch_delete,
-            &keys,
-        )?;
-
-        let cf = Self::rawkv_cf(&cf, self.api_version)?;
-        check_key_size!(keys.iter(), self.max_key_size, callback);
-
-        let modifies = keys
-            .into_iter()
-            .map(|k| Self::raw_delete_request_to_modify(cf, k))
-            .collect();
-        let mut batch = WriteData::from_modifies(modifies);
-        batch.set_allowed_on_disk_almost_full();
-
-        self.engine.async_write(
-            &ctx,
-            batch,
-            Box::new(|res| callback(res.map_err(Error::from))),
-        )?;
-        KV_COMMAND_COUNTER_VEC_STATIC.raw_batch_delete.inc();
-        Ok(())
+    ) -> impl Future<Output = Result<()>> {
+        let api_version = self.api_version;
+        let engine = self.engine.clone();
+        let provider = self.causal_ts_provider.clone();
+        async move {
+            Self::check_api_version(
+                api_version,
+                ctx.api_version,
+                CommandKind::raw_batch_delete,
+                &keys,
+            )?;
+    
+            let cf = Self::rawkv_cf(&cf, api_version)?;
+            // check_key_size!(keys.iter(), self.max_key_size, callback);
+            let ts = Self::get_ts_from_provider(provider).await?;
+            let modifies = keys
+                .into_iter()
+                .map(|k| Self::raw_delete_request_to_modify(cf, k, ts))
+                .collect();
+            let mut batch = WriteData::from_modifies(modifies);
+            batch.set_allowed_on_disk_almost_full();
+    
+            engine.async_write(
+                &ctx,
+                batch,
+                Box::new(|res| callback(res.map_err(Error::from))),
+            )?;
+            KV_COMMAND_COUNTER_VEC_STATIC.raw_batch_delete.inc();
+            Ok(())
+        }
     }
 
     /// Scan raw keys in a range.
@@ -2422,23 +2471,28 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
         value: Vec<u8>,
         ttl: u64,
         cb: Callback<(Option<Value>, bool)>,
-    ) -> Result<()> {
-        Self::check_api_version(
-            self.api_version,
-            ctx.api_version,
-            CommandKind::raw_compare_and_swap,
-            [&key],
-        )?;
-        let cf = Self::rawkv_cf(&cf, self.api_version)?;
-
-        if !F::IS_TTL_ENABLED && ttl != 0 {
-            return Err(Error::from(ErrorInner::TtlNotEnabled));
+    ) -> impl Future<Output = Result<()>> {
+        let api_version = self.api_version;
+        let provider = self.causal_ts_provider.clone();
+        let sched = self.sched.clone();
+        async move {
+            Self::check_api_version(
+                api_version,
+                ctx.api_version,
+                CommandKind::raw_compare_and_swap,
+                [&key],
+            )?;
+            let cf = Self::rawkv_cf(&cf, api_version)?;
+    
+            if !F::IS_TTL_ENABLED && ttl != 0 {
+                return Err(Error::from(ErrorInner::TtlNotEnabled));
+            }
+            let ts = Self::get_ts_from_provider(provider).await?;
+            let key = F::encode_raw_key_owned(key, ts);
+            let cmd =
+                RawCompareAndSwap::new(cf, key, previous_value, value, ttl, api_version, ctx);
+            Self::sched_raw_command(sched, cmd, cb)
         }
-
-        let key = F::encode_raw_key_owned(key, None);
-        let cmd =
-            RawCompareAndSwap::new(cf, key, previous_value, value, ttl, self.api_version, ctx);
-        self.sched_txn_command(cmd, cb)
     }
 
     pub fn raw_batch_put_atomic(
@@ -2448,18 +2502,23 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
         pairs: Vec<KvPair>,
         ttls: Vec<u64>,
         callback: Callback<()>,
-    ) -> Result<()> {
-        Self::check_api_version(
-            self.api_version,
-            ctx.api_version,
-            CommandKind::raw_atomic_store,
-            pairs.iter().map(|(ref k, _)| k),
-        )?;
-
-        let cf = Self::rawkv_cf(&cf, self.api_version)?;
-        let modifies = Self::raw_batch_put_requests_to_modifies(cf, pairs, ttls)?;
-        let cmd = RawAtomicStore::new(cf, modifies, ctx);
-        self.sched_txn_command(cmd, callback)
+    ) -> impl Future<Output = Result<()>> {
+        let api_version = self.api_version;
+        let provider = self.causal_ts_provider.clone();
+        let sched = self.sched.clone();
+        async move {
+            Self::check_api_version(
+                api_version,
+                ctx.api_version,
+                CommandKind::raw_atomic_store,
+                pairs.iter().map(|(ref k, _)| k),
+            )?;
+            let ts = Self::get_ts_from_provider(provider).await?;
+            let cf = Self::rawkv_cf(&cf, api_version)?;
+            let modifies = Self::raw_batch_put_requests_to_modifies(cf, pairs, ttls, ts)?;
+            let cmd = RawAtomicStore::new(cf, modifies, ctx);
+            Self::sched_raw_command(sched, cmd, callback)
+        }
     }
 
     pub fn raw_batch_delete_atomic(
@@ -2468,21 +2527,26 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
         cf: String,
         keys: Vec<Vec<u8>>,
         callback: Callback<()>,
-    ) -> Result<()> {
-        Self::check_api_version(
-            self.api_version,
-            ctx.api_version,
-            CommandKind::raw_atomic_store,
-            &keys,
-        )?;
-
-        let cf = Self::rawkv_cf(&cf, self.api_version)?;
-        let modifies = keys
-            .into_iter()
-            .map(|k| Self::raw_delete_request_to_modify(cf, k))
-            .collect();
-        let cmd = RawAtomicStore::new(cf, modifies, ctx);
-        self.sched_txn_command(cmd, callback)
+    ) -> impl Future<Output = Result<()>> {
+        let api_version = self.api_version;
+        let provider = self.causal_ts_provider.clone();
+        let sched = self.sched.clone();
+        async move {
+            Self::check_api_version(
+                api_version,
+                ctx.api_version,
+                CommandKind::raw_atomic_store,
+                &keys,
+            )?;
+            let ts = Self::get_ts_from_provider(provider).await?;
+            let cf = Self::rawkv_cf(&cf, api_version)?;
+            let modifies = keys
+                .into_iter()
+                .map(|k| Self::raw_delete_request_to_modify(cf, k, ts))
+                .collect();
+            let cmd = RawAtomicStore::new(cf, modifies, ctx);
+            Self::sched_raw_command(sched, cmd, callback)
+        }
     }
 
     pub fn raw_checksum(

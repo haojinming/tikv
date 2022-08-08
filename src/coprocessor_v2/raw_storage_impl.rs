@@ -107,7 +107,7 @@ impl<E: Engine, L: LockManager, F: KvFormat> RawStorage for RawStorageImpl<'_, E
 
         let res = self
             .storage
-            .raw_batch_put(ctx, String::new(), kv_pairs, ttls, cb);
+            .raw_batch_put(ctx, String::new(), kv_pairs, ttls, cb).await;
 
         match res {
             Err(e) => Err(e),
@@ -121,7 +121,7 @@ impl<E: Engine, L: LockManager, F: KvFormat> RawStorage for RawStorageImpl<'_, E
         let ctx = self.context.clone();
         let (cb, f) = paired_future_callback();
 
-        let res = self.storage.raw_delete(ctx, String::new(), key, cb);
+        let res = self.storage.raw_delete(ctx, String::new(), key, cb).await;
 
         match res {
             Err(e) => Err(e),
@@ -135,7 +135,7 @@ impl<E: Engine, L: LockManager, F: KvFormat> RawStorage for RawStorageImpl<'_, E
         let ctx = self.context.clone();
         let (cb, f) = paired_future_callback();
 
-        let res = self.storage.raw_batch_delete(ctx, String::new(), keys, cb);
+        let res = self.storage.raw_batch_delete(ctx, String::new(), keys, cb).await;
 
         match res {
             Err(e) => Err(e),
@@ -152,7 +152,7 @@ impl<E: Engine, L: LockManager, F: KvFormat> RawStorage for RawStorageImpl<'_, E
 
         let res =
             self.storage
-                .raw_delete_range(ctx, String::new(), key_range.start, key_range.end, cb);
+                .raw_delete_range(ctx, String::new(), key_range.start, key_range.end, cb).await;
 
         match res {
             Err(e) => Err(e),

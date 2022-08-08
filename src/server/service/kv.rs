@@ -59,11 +59,13 @@ use crate::{
             extract_committed, extract_key_error, extract_key_errors, extract_kv_pairs,
             extract_region_error, map_kv_pairs,
         },
+        Result as StorageResult,
         kv::Engine,
         lock_manager::LockManager,
         SecondaryLocksStatus, Storage, TxnStatus,
     },
 };
+use futures::future::Either::*;
 
 const GRPC_MSG_MAX_BATCH_SIZE: usize = 128;
 const GRPC_MSG_NOTIFY_SIZE: usize = 8;
@@ -1691,36 +1693,27 @@ fn future_raw_put<E: Engine, L: LockManager, F: KvFormat>(
     mut req: RawPutRequest,
 ) -> impl Future<Output = ServerResult<RawPutResponse>> {
     let (cb, f) = paired_future_callback();
-    // let for_atomic = req.get_for_cas();
-    // let res = if for_atomic {
-    //     storage.raw_batch_put_atomic(
-    //         req.take_context(),
-    //         req.take_cf(),
-    //         vec![(req.take_key(), req.take_value())],
-    //         vec![req.get_ttl()],
-    //         cb,
-    //     )
-    // } else {
-    //     storage.raw_put(
-    //         req.take_context(),
-    //         req.take_cf(),
-    //         req.take_key(),
-    //         req.take_value(),
-    //         req.get_ttl(),
-    //         cb,
-    //     )
-    // };
-    let res = storage.raw_put(
-        req.take_context(),
-        req.take_cf(),
-        req.take_key(),
-        req.take_value(),
-        req.get_ttl(),
-        cb,
-    );
+    let for_atomic = req.get_for_cas();
+    let res = if for_atomic {
+        Left(storage.raw_batch_put_atomic(
+            req.take_context(),
+            req.take_cf(),
+            vec![(req.take_key(), req.take_value())],
+            vec![req.get_ttl()],
+            cb,
+        ))
+    } else {
+        Right(storage.raw_put(
+            req.take_context(),
+            req.take_cf(),
+            req.take_key(),
+            req.take_value(),
+            req.get_ttl(),
+            cb,
+        ))
+    };
 
     async move {
-        
         let v = match res.await {
             Err(e) => Err(e),
             Ok(_) => f.await?,
@@ -1764,13 +1757,13 @@ fn future_raw_batch_put<E: Engine, L: LockManager, F: KvFormat>(
     let (cb, f) = paired_future_callback();
     let for_atomic = req.get_for_cas();
     let res = if for_atomic {
-        storage.raw_batch_put_atomic(req.take_context(), cf, pairs, ttls, cb)
+        Left(storage.raw_batch_put_atomic(req.take_context(), cf, pairs, ttls, cb))
     } else {
-        storage.raw_batch_put(req.take_context(), cf, pairs, ttls, cb)
+        Right(storage.raw_batch_put(req.take_context(), cf, pairs, ttls, cb))
     };
 
     async move {
-        let v = match res {
+        let v = match res.await {
             Err(e) => Err(e),
             Ok(_) => f.await?,
         };
@@ -1791,13 +1784,13 @@ fn future_raw_delete<E: Engine, L: LockManager, F: KvFormat>(
     let (cb, f) = paired_future_callback();
     let for_atomic = req.get_for_cas();
     let res = if for_atomic {
-        storage.raw_batch_delete_atomic(req.take_context(), req.take_cf(), vec![req.take_key()], cb)
+        Left(storage.raw_batch_delete_atomic(req.take_context(), req.take_cf(), vec![req.take_key()], cb))
     } else {
-        storage.raw_delete(req.take_context(), req.take_cf(), req.take_key(), cb)
+        Right(storage.raw_delete(req.take_context(), req.take_cf(), req.take_key(), cb))
     };
 
     async move {
-        let v = match res {
+        let v = match res.await {
             Err(e) => Err(e),
             Ok(_) => f.await?,
         };
@@ -1820,13 +1813,13 @@ fn future_raw_batch_delete<E: Engine, L: LockManager, F: KvFormat>(
     let (cb, f) = paired_future_callback();
     let for_atomic = req.get_for_cas();
     let res = if for_atomic {
-        storage.raw_batch_delete_atomic(req.take_context(), cf, keys, cb)
+        Left(storage.raw_batch_delete_atomic(req.take_context(), cf, keys, cb))
     } else {
-        storage.raw_batch_delete(req.take_context(), cf, keys, cb)
+        Right(storage.raw_batch_delete(req.take_context(), cf, keys, cb))
     };
 
     async move {
-        let v = match res {
+        let v = match res.await {
             Err(e) => Err(e),
             Ok(_) => f.await?,
         };
@@ -1910,7 +1903,7 @@ fn future_raw_delete_range<E: Engine, L: LockManager, F: KvFormat>(
     );
 
     async move {
-        let v = match res {
+        let v = match res.await {
             Err(e) => Err(e),
             Ok(_) => f.await?,
         };
@@ -1966,7 +1959,7 @@ fn future_raw_compare_and_swap<E: Engine, L: LockManager, F: KvFormat>(
         cb,
     );
     async move {
-        let v = match res {
+        let v = match res.await {
             Ok(()) => f.await?,
             Err(e) => Err(e),
         };
