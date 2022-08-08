@@ -21,12 +21,15 @@ use txn_types::TimeStamp;
 pub use crate::errors::Result;
 
 /// Trait of causal timestamp provider.
+#[async_trait::async_trait]
 pub trait CausalTsProvider: Send + Sync {
     /// Get a new timestamp.
     fn get_ts(&self) -> Result<TimeStamp>;
 
-    /// Flush (cached) timestamps to keep causality on some events, such as
-    /// "leader transfer".
+    /// Get a new timestamp.
+    async fn get_ts_async(&self) -> Result<TimeStamp>;
+
+    /// Flush (cached) timestamps to keep causality on some events, such as "leader transfer".
     fn flush(&self) -> Result<()> {
         Ok(())
     }
@@ -58,8 +61,13 @@ pub mod tests {
         }
     }
 
+    #[async_trait::async_trait]
     impl CausalTsProvider for TestProvider {
         fn get_ts(&self) -> Result<TimeStamp> {
+            Ok(self.ts.fetch_add(1, Ordering::Relaxed).into())
+        }
+
+        async fn get_ts_async(&self) -> Result<TimeStamp> {
             Ok(self.ts.fetch_add(1, Ordering::Relaxed).into())
         }
 

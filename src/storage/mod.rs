@@ -94,6 +94,7 @@ use tracker::{
     clear_tls_tracker_token, set_tls_tracker_token, with_tls_tracker, TrackedFuture, TrackerToken,
 };
 use txn_types::{Key, KvPair, Lock, OldValues, TimeStamp, TsSet, Value};
+use causal_ts::CausalTsProvider;
 
 pub use self::{
     errors::{get_error_kind_from_header, get_tag_from_header, Error, ErrorHeaderKind, ErrorInner},
@@ -175,6 +176,8 @@ pub struct Storage<E: Engine, L: LockManager, F: KvFormat> {
 
     resource_tag_factory: ResourceTagFactory,
 
+    causal_ts_provider: Option<Arc<dyn CausalTsProvider>>,
+
     api_version: ApiVersion, // TODO: remove this. Use `Api` instead.
 
     quota_limiter: Arc<QuotaLimiter>,
@@ -203,6 +206,7 @@ impl<E: Engine, L: LockManager, F: KvFormat> Clone for Storage<E, L, F> {
             max_key_size: self.max_key_size,
             concurrency_manager: self.concurrency_manager.clone(),
             api_version: self.api_version,
+            causal_ts_provider: self.causal_ts_provider.clone(),
             resource_tag_factory: self.resource_tag_factory.clone(),
             quota_limiter: Arc::clone(&self.quota_limiter),
             _phantom: PhantomData,
@@ -256,6 +260,7 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
         resource_tag_factory: ResourceTagFactory,
         quota_limiter: Arc<QuotaLimiter>,
         feature_gate: FeatureGate,
+        causal_ts_provider: Option<Arc<dyn CausalTsProvider>>,
     ) -> Result<Self> {
         assert_eq!(config.api_version(), F::TAG, "Api version not match");
 
@@ -282,6 +287,7 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
             refs: Arc::new(atomic::AtomicUsize::new(1)),
             max_key_size: config.max_key_size,
             api_version: config.api_version(),
+            causal_ts_provider,
             resource_tag_factory,
             quota_limiter,
             _phantom: PhantomData,
@@ -1806,39 +1812,46 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
         value: Vec<u8>,
         ttl: u64,
         callback: Callback<()>,
-    ) -> Result<()> {
+    ) -> impl Future<Output = Result<Option<Vec<u8>>>> {
         const CMD: CommandKind = CommandKind::raw_put;
         let api_version = self.api_version;
+        let provider = self.causal_ts_provider.clone().unwrap();
+        let engine = self.engine.clone();
 
-        Self::check_api_version(api_version, ctx.api_version, CMD, [&key])?;
+        async move {
+            // Self::check_api_version(api_version, ctx.api_version, CMD, [&key])?;
 
-        check_key_size!(Some(&key).into_iter(), self.max_key_size, callback);
+            // check_key_size!(Some(&key).into_iter(), self.max_key_size, callback);
 
-        if !F::IS_TTL_ENABLED && ttl != 0 {
-            return Err(Error::from(ErrorInner::TtlNotEnabled));
+            // if !F::IS_TTL_ENABLED && ttl != 0 {
+            //     return Err(Error::from(ErrorInner::TtlNotEnabled));
+            // }
+            let ts = provider.get_ts_async().await.unwrap();
+            let raw_value = RawValue {
+                user_value: value,
+                expire_ts: ttl_to_expire_ts(ttl),
+                is_delete: false,
+            };
+            let m = Modify::Put(
+                Self::rawkv_cf(&cf, api_version)?,
+                F::encode_raw_key_owned(key, Some(ts)),
+                F::encode_raw_value_owned(raw_value),
+            );
+    
+            let mut batch = WriteData::from_modifies(vec![m]);
+            batch.set_allowed_on_disk_almost_full();
+    
+            let async_ret = engine.async_write(
+                &ctx,
+                batch,
+                Box::new(|res| callback(res.map_err(Error::from))),
+            );
+            if async_ret.is_err() {
+                return Err(Error::from(ErrorInner::TtlNotEnabled));
+            }
+            KV_COMMAND_COUNTER_VEC_STATIC.raw_put.inc();
+            Ok(Some(vec![0]))
         }
-
-        let raw_value = RawValue {
-            user_value: value,
-            expire_ts: ttl_to_expire_ts(ttl),
-            is_delete: false,
-        };
-        let m = Modify::Put(
-            Self::rawkv_cf(&cf, self.api_version)?,
-            F::encode_raw_key_owned(key, None),
-            F::encode_raw_value_owned(raw_value),
-        );
-
-        let mut batch = WriteData::from_modifies(vec![m]);
-        batch.set_allowed_on_disk_almost_full();
-
-        self.engine.async_write(
-            &ctx,
-            batch,
-            Box::new(|res| callback(res.map_err(Error::from))),
-        )?;
-        KV_COMMAND_COUNTER_VEC_STATIC.raw_put.inc();
-        Ok(())
     }
 
     fn raw_batch_put_requests_to_modifies(
@@ -2865,6 +2878,7 @@ impl<E: Engine, L: LockManager, F: KvFormat> TestStorageBuilder<E, L, F> {
             self.resource_tag_factory,
             Arc::new(QuotaLimiter::default()),
             latest_feature_gate(),
+            None,
         )
     }
 
@@ -2893,6 +2907,7 @@ impl<E: Engine, L: LockManager, F: KvFormat> TestStorageBuilder<E, L, F> {
             ResourceTagFactory::new_for_test(),
             Arc::new(QuotaLimiter::default()),
             latest_feature_gate(),
+            None,
         )
     }
 }

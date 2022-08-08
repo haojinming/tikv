@@ -88,7 +88,7 @@ impl<Ts: CausalTsProvider, Tk: RawTsTracker> QueryObserver for CausalObserver<Ts
         ctx: &mut ObserverContext<'_>,
         requests: &mut Vec<RaftRequest>,
     ) -> coprocessor::Result<()> {
-        let region_id = ctx.region().get_id();
+        /*let region_id = ctx.region().get_id();
         let mut ts = None;
 
         for req in requests.iter_mut().filter(|r| {
@@ -111,7 +111,7 @@ impl<Ts: CausalTsProvider, Tk: RawTsTracker> QueryObserver for CausalObserver<Ts
             ApiV2::append_ts_on_encoded_bytes(req.mut_put().mut_key(), ts.unwrap());
             trace!("CausalObserver::pre_propose_query, append_ts"; "region_id" => region_id,
                 "key" => &log_wrappers::Value::key(req.get_put().get_key()), "ts" => ?ts.unwrap());
-        }
+            }*/
         Ok(())
     }
 }

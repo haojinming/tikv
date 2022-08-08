@@ -561,6 +561,7 @@ impl<C: PdClient + 'static> BatchTsoProvider<C> {
 
 const GET_TS_MAX_RETRY: u32 = 3;
 
+#[async_trait::async_trait]
 impl<C: PdClient + 'static> CausalTsProvider for BatchTsoProvider<C> {
     // TODO: support `after_ts` argument.
     fn get_ts(&self) -> Result<TimeStamp> {
@@ -602,7 +603,46 @@ impl<C: PdClient + 'static> CausalTsProvider for BatchTsoProvider<C> {
         Err(Error::TsoBatchUsedUp(last_batch_size))
     }
 
-    // TODO: provide asynchronous method
+    /// Get a new timestamp.
+    async fn get_ts_async(&self) -> Result<TimeStamp> {
+        let start = Instant::now();
+        let mut retries = 0;
+        let mut last_batch_size: u32;
+        loop {
+            {
+                last_batch_size = self.batch_list.remain() + self.batch_list.usage();
+                match self.batch_list.pop(None) {
+                    Some(ts) => {
+                        trace!("BatchTsoProvider::get_ts: {:?}", ts);
+                        TS_PROVIDER_GET_TS_DURATION_STATIC
+                            .ok
+                            .observe(start.saturating_elapsed_secs());
+                        return Ok(ts);
+                    }
+                    None => {
+                        warn!("BatchTsoProvider::get_ts, batch used up"; "last_batch_size" => last_batch_size, "retries" => retries);
+                    }
+                }
+            }
+
+            if retries >= GET_TS_MAX_RETRY {
+                break;
+            }
+            if let Err(err) = self.renew_tso_batch(false, TsoBatchRenewReason::used_up).await {
+                // `renew_tso_batch` failure is likely to be caused by TSO timeout, which would
+                // mean that PD is quite busy. So do not retry any more.
+                error!("BatchTsoProvider::get_ts, renew_tso_batch fail on batch used-up"; "err" => ?err);
+                break;
+            }
+            retries += 1;
+        }
+        error!("BatchTsoProvider::get_ts, batch used up"; "last_batch_size" => last_batch_size, "retries" => retries);
+        TS_PROVIDER_GET_TS_DURATION_STATIC
+            .err
+            .observe(start.saturating_elapsed_secs());
+        Err(Error::TsoBatchUsedUp(last_batch_size))
+    }
+
     fn flush(&self) -> Result<()> {
         block_on(self.renew_tso_batch(true, TsoBatchRenewReason::flush))
     }
@@ -620,10 +660,16 @@ impl SimpleTsoProvider {
     }
 }
 
+#[async_trait::async_trait]
 impl CausalTsProvider for SimpleTsoProvider {
     fn get_ts(&self) -> Result<TimeStamp> {
         let ts = block_on(self.pd_client.get_tso())?;
         debug!("SimpleTsoProvider::get_ts"; "ts" => ?ts);
+        Ok(ts)
+    }
+    async fn get_ts_async(&self) -> Result<TimeStamp> {
+        let ts = self.pd_client.get_tso().await?;
+        //debug!("SimpleTsoProvider::get_ts"; "ts" => ?ts);
         Ok(ts)
     }
 }
