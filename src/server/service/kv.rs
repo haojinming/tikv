@@ -1691,37 +1691,28 @@ fn future_raw_put<E: Engine, L: LockManager, F: KvFormat>(
     mut req: RawPutRequest,
 ) -> impl Future<Output = ServerResult<RawPutResponse>> {
     let (cb, f) = paired_future_callback();
-    // let for_atomic = req.get_for_cas();
-    // let res = if for_atomic {
-    //     storage.raw_batch_put_atomic(
-    //         req.take_context(),
-    //         req.take_cf(),
-    //         vec![(req.take_key(), req.take_value())],
-    //         vec![req.get_ttl()],
-    //         cb,
-    //     )
-    // } else {
-    //     storage.raw_put(
-    //         req.take_context(),
-    //         req.take_cf(),
-    //         req.take_key(),
-    //         req.take_value(),
-    //         req.get_ttl(),
-    //         cb,
-    //     )
-    // };
-    let res = storage.raw_put(
-        req.take_context(),
-        req.take_cf(),
-        req.take_key(),
-        req.take_value(),
-        req.get_ttl(),
-        cb,
-    );
-
+    let for_atomic = req.get_for_cas();
+    let res = if for_atomic {
+        storage.raw_batch_put_atomic(
+            req.take_context(),
+            req.take_cf(),
+            vec![(req.take_key(), req.take_value())],
+            vec![req.get_ttl()],
+            cb,
+        )
+    } else {
+        storage.raw_put(
+            req.take_context(),
+            req.take_cf(),
+            req.take_key(),
+            req.take_value(),
+            req.get_ttl(),
+            cb,
+        )
+    };
     async move {
         
-        let v = match res.await {
+        let v = match res {
             Err(e) => Err(e),
             Ok(_) => f.await?,
         };

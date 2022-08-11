@@ -90,7 +90,7 @@ impl<E: Engine, L: LockManager, F: KvFormat> RawStorage for RawStorageImpl<'_, E
 
         let res = self
             .storage
-            .raw_put(ctx, String::new(), key, value, ttl, cb).await;
+            .raw_put(ctx, String::new(), key, value, ttl, cb);
 
         match res {
             Err(e) => Err(e),
