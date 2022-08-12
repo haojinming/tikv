@@ -71,6 +71,7 @@ use std::{
 };
 
 use api_version::{ApiV1, ApiV2, KeyMode, KvFormat, RawValue};
+use causal_ts::CausalTsProvider;
 use concurrency_manager::ConcurrencyManager;
 use engine_traits::{raw_ttl::ttl_to_expire_ts, CfName, CF_DEFAULT, CF_LOCK, CF_WRITE, DATA_CFS};
 use futures::prelude::*;
@@ -87,6 +88,7 @@ use rand::prelude::*;
 use resource_metering::{FutureExt, ResourceTagFactory};
 use tikv_kv::SnapshotExt;
 use tikv_util::{
+    future::paired_future_callback,
     quota_limiter::QuotaLimiter,
     time::{duration_to_ms, Instant, ThreadReadId},
 };
@@ -94,7 +96,6 @@ use tracker::{
     clear_tls_tracker_token, set_tls_tracker_token, with_tls_tracker, TrackedFuture, TrackerToken,
 };
 use txn_types::{Key, KvPair, Lock, OldValues, TimeStamp, TsSet, Value};
-use causal_ts::CausalTsProvider;
 
 pub use self::{
     errors::{get_error_kind_from_header, get_tag_from_header, Error, ErrorHeaderKind, ErrorInner},
@@ -1456,7 +1457,12 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
     where
         FU: Future + Send + 'static,
     {
-        if let Err(_) = self.sched.get_sched_pool(CommandPri::Normal).pool.spawn(future) {
+        if let Err(_) = self
+            .sched
+            .get_sched_pool(CommandPri::Normal)
+            .pool
+            .spawn(future)
+        {
             return Err(box_err!("schedule raw cmd fails"));
         }
         Ok(())
@@ -1813,68 +1819,19 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
         }
     }
 
-    fn get_causal_ts_from_provider(provider: Option<Arc<dyn CausalTsProvider>>) -> Result<Option<TimeStamp>>{
+    fn get_causal_ts_from_provider(
+        provider: Option<Arc<dyn CausalTsProvider>>,
+    ) -> Result<Option<TimeStamp>> {
         let mut ts = None;
         if let Some(p) = provider {
             let ret = p.get_ts();
-            if let Err(e) = ret {
+            if let Err(_) = ret {
                 return Err(box_err!("fail to get causal ts"));
             } else {
                 ts = Some(ret.unwrap());
             }
         }
         Ok(ts)
-    }
-
-    fn raw_put_impl(
-        ctx: Context,
-        cf: String,
-        key: Vec<u8>,
-        value: Vec<u8>,
-        ttl: u64,
-        callback: Callback<()>,
-        api_version: ApiVersion,
-        provider: Option<Arc<dyn CausalTsProvider>>,
-        engine: E,
-    ) -> Result<()> {
-        const CMD: CommandKind = CommandKind::raw_put;
-        Self::check_api_version(api_version, ctx.api_version, CMD, [&key])?;
-    
-        // check_key_size!(Some(&key).into_iter(), self.max_key_size, callback);
-
-        if !F::IS_TTL_ENABLED && ttl != 0 {
-            return Err(Error::from(ErrorInner::TtlNotEnabled));
-        }
-        let ts_ret = Self::get_causal_ts_from_provider(provider);
-        if let Err(_) = ts_ret {
-            return Err(box_err!("fail to get causal ts"));
-        }
-        let ts = ts_ret.unwrap();
-        let raw_value = RawValue {
-            user_value: value,
-            expire_ts: ttl_to_expire_ts(ttl),
-            is_delete: false,
-        };
-        let cf_ret = Self::rawkv_cf(&cf, api_version);
-        if let Err(e) = cf_ret {
-            return Err(Error::from(e));
-        }
-        let cf = cf_ret.unwrap();
-        let m = Modify::Put(
-            cf,
-            F::encode_raw_key_owned(key, ts),
-            F::encode_raw_value_owned(raw_value),
-        );
-
-        let mut batch = WriteData::from_modifies(vec![m]);
-        batch.set_allowed_on_disk_almost_full();
-        engine.async_write(
-            &ctx,
-            batch,
-            Box::new(|res| callback(res.map_err(Error::from))),
-        )?;
-        KV_COMMAND_COUNTER_VEC_STATIC.raw_put.inc();
-        Ok(())
     }
 
     /// Write a raw key to the storage.
@@ -1887,19 +1844,54 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
         ttl: u64,
         callback: Callback<()>,
     ) -> Result<()> {
-        let api_version = self.api_version;
+        const CMD: CommandKind = CommandKind::raw_put;
+        Self::check_api_version(self.api_version, ctx.api_version, CMD, [&key])?;
+        check_key_size!(Some(&key).into_iter(), self.max_key_size, callback);
+        if !F::IS_TTL_ENABLED && ttl != 0 {
+            return Err(Error::from(ErrorInner::TtlNotEnabled));
+        }
+        let cf = Self::rawkv_cf(&cf, self.api_version)?;
         let provider = self.causal_ts_provider.clone();
         let engine = self.engine.clone();
-
-        self.sched_raw_command(
-            async move {
-                let ret = Self::raw_put_impl(ctx, cf, key, value, ttl, callback, api_version, provider, engine);
-                if let Err(e) = ret {
-                    callback(Err(Error::from(e)));
-                }
+        let concurrency_manager = self.concurrency_manager.clone();
+        let (cb, f) = paired_future_callback();
+        self.sched_raw_command(async move {
+            let ts = Self::get_causal_ts_from_provider(provider);
+            if let Err(e) = ts {
+                return callback(Err(e));
             }
-        ).unwrap();
-        return Ok(())
+            let raw_value = RawValue {
+                user_value: value,
+                expire_ts: ttl_to_expire_ts(ttl),
+                is_delete: false,
+            };
+            let key = F::encode_raw_key_owned(key, ts.unwrap());
+            let key_guard = concurrency_manager.lock_key(&key).await;
+            let m = Modify::Put(
+                cf,
+                key,
+                F::encode_raw_value_owned(raw_value),
+            );
+
+            let mut batch = WriteData::from_modifies(vec![m]);
+            batch.set_allowed_on_disk_almost_full();
+            let async_ret = engine.async_write(
+                &ctx,
+                batch,
+                Box::new(|res| {
+                    drop(key_guard);
+                    cb(res.map_err(Error::from))
+                }),
+            );
+            let v: Result<()> = match async_ret {
+                Err(e) => Err(Error::from(e)),
+                Ok(_) => f.await.unwrap(),
+            };
+            KV_COMMAND_COUNTER_VEC_STATIC.raw_put.inc();
+            callback(v)
+        })
+        .unwrap();
+        return Ok(());
     }
 
     fn raw_batch_put_requests_to_modifies(
@@ -2926,7 +2918,7 @@ impl<E: Engine, L: LockManager, F: KvFormat> TestStorageBuilder<E, L, F> {
             self.resource_tag_factory,
             Arc::new(QuotaLimiter::default()),
             latest_feature_gate(),
-            None,
+            Some(Arc::new(causal_ts::tests::TestProvider::default())),
         )
     }
 

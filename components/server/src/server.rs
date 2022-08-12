@@ -746,7 +746,9 @@ where
             resource_tag_factory.clone(),
             Arc::clone(&self.quota_limiter),
             self.pd_client.feature_gate().clone(),
-            self.causal_ts_provider.clone().map(|provider| provider as Arc<dyn CausalTsProvider>),
+            self.causal_ts_provider
+                .clone()
+                .map(|provider| provider as Arc<dyn CausalTsProvider>),
         )
         .unwrap_or_else(|e| fatal!("failed to create raft storage: {}", e));
         cfg_controller.register(

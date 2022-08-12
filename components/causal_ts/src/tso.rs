@@ -628,7 +628,10 @@ impl<C: PdClient + 'static> CausalTsProvider for BatchTsoProvider<C> {
             if retries >= GET_TS_MAX_RETRY {
                 break;
             }
-            if let Err(err) = self.renew_tso_batch(false, TsoBatchRenewReason::used_up).await {
+            if let Err(err) = self
+                .renew_tso_batch(false, TsoBatchRenewReason::used_up)
+                .await
+            {
                 // `renew_tso_batch` failure is likely to be caused by TSO timeout, which would
                 // mean that PD is quite busy. So do not retry any more.
                 error!("BatchTsoProvider::get_ts, renew_tso_batch fail on batch used-up"; "err" => ?err);
@@ -669,7 +672,7 @@ impl CausalTsProvider for SimpleTsoProvider {
     }
     async fn get_ts_async(&self) -> Result<TimeStamp> {
         let ts = self.pd_client.get_tso().await?;
-        //debug!("SimpleTsoProvider::get_ts"; "ts" => ?ts);
+        // debug!("SimpleTsoProvider::get_ts"; "ts" => ?ts);
         Ok(ts)
     }
 }

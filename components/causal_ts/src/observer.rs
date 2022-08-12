@@ -88,30 +88,30 @@ impl<Ts: CausalTsProvider, Tk: RawTsTracker> QueryObserver for CausalObserver<Ts
         ctx: &mut ObserverContext<'_>,
         requests: &mut Vec<RaftRequest>,
     ) -> coprocessor::Result<()> {
-        /*let region_id = ctx.region().get_id();
-        let mut ts = None;
-
-        for req in requests.iter_mut().filter(|r| {
-            r.get_cmd_type() == CmdType::Put
-                && ApiV2::parse_key_mode(r.get_put().get_key()) == KeyMode::Raw
-        }) {
-            if ts.is_none() {
-                ts = Some(self.causal_ts_provider.get_ts().map_err(|err| {
-                    coprocessor::Error::Other(box_err!("Get causal timestamp error: {:?}", err))
-                })?);
-                // use prev ts as `resolved_ts` means the data with smaller or equal ts has
-                // already sink to cdc.
-                self.ts_tracker
-                    .track_ts(region_id, ts.unwrap().prev())
-                    .map_err(|err| {
-                        coprocessor::Error::Other(box_err!("track ts err: {:?}", err))
-                    })?;
-            }
-
-            ApiV2::append_ts_on_encoded_bytes(req.mut_put().mut_key(), ts.unwrap());
-            trace!("CausalObserver::pre_propose_query, append_ts"; "region_id" => region_id,
-                "key" => &log_wrappers::Value::key(req.get_put().get_key()), "ts" => ?ts.unwrap());
-            }*/
+        // let region_id = ctx.region().get_id();
+        // let mut ts = None;
+        //
+        // for req in requests.iter_mut().filter(|r| {
+        // r.get_cmd_type() == CmdType::Put
+        // && ApiV2::parse_key_mode(r.get_put().get_key()) == KeyMode::Raw
+        // }) {
+        // if ts.is_none() {
+        // ts = Some(self.causal_ts_provider.get_ts().map_err(|err| {
+        // coprocessor::Error::Other(box_err!("Get causal timestamp error: {:?}", err))
+        // })?);
+        // use prev ts as `resolved_ts` means the data with smaller or equal ts has
+        // already sink to cdc.
+        // self.ts_tracker
+        // .track_ts(region_id, ts.unwrap().prev())
+        // .map_err(|err| {
+        // coprocessor::Error::Other(box_err!("track ts err: {:?}", err))
+        // })?;
+        // }
+        //
+        // ApiV2::append_ts_on_encoded_bytes(req.mut_put().mut_key(), ts.unwrap());
+        // trace!("CausalObserver::pre_propose_query, append_ts"; "region_id" =>
+        // region_id, "key" => &log_wrappers::Value::key(req.get_put().
+        // get_key()), "ts" => ?ts.unwrap()); }
         Ok(())
     }
 }

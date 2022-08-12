@@ -1711,7 +1711,6 @@ fn future_raw_put<E: Engine, L: LockManager, F: KvFormat>(
         )
     };
     async move {
-        
         let v = match res {
             Err(e) => Err(e),
             Ok(_) => f.await?,
