@@ -1453,6 +1453,21 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
         Ok(())
     }
 
+    fn sched_raw_atomic_command<T: StorageCallbackType>(
+        sched: TxnScheduler<E, L>,
+        cmd: TypedCommand<T>,
+        callback: Callback<T>,
+    ) {
+        let cmd: Command = cmd.into();
+        with_tls_tracker(|tracker| {
+            tracker.req_info.start_ts = cmd.ts().into_inner();
+            tracker.req_info.request_type = cmd.request_type();
+        });
+
+        cmd.incr_cmd_metric();
+        sched.run_cmd(cmd, T::callback(callback));
+    }
+
     pub fn sched_raw_command<FU>(&self, future: FU) -> Result<()>
     where
         FU: Future + Send + 'static,
@@ -1894,21 +1909,24 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
         return Ok(());
     }
 
-    fn raw_batch_put_requests_to_modifies(
-        cf: CfName,
-        pairs: Vec<KvPair>,
-        ttls: Vec<u64>,
-    ) -> Result<Vec<Modify>> {
+    fn raw_check_ttl(pair_len: usize, ttls: &Vec<u64>) ->  Result<()> {
         if !F::IS_TTL_ENABLED {
             if ttls.iter().any(|&x| x != 0) {
                 return Err(Error::from(ErrorInner::TtlNotEnabled));
             }
-        } else if ttls.len() != pairs.len() {
+        } else if ttls.len() != pair_len {
             return Err(Error::from(ErrorInner::TtlLenNotEqualsToPairs));
         }
+        Ok(())
+    }
 
-        let modifies = pairs
-            .into_iter()
+    fn raw_batch_put_requests_to_modifies(
+        cf: CfName,
+        pairs: Vec<KvPair>,
+        ttls: Vec<u64>,
+        ts: Option<TimeStamp>, // one batch use same causal ts.
+    ) -> Vec<Modify> {
+        pairs.into_iter()
             .zip(ttls)
             .map(|((k, v), ttl)| {
                 let raw_value = RawValue {
@@ -1918,12 +1936,11 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
                 };
                 Modify::Put(
                     cf,
-                    F::encode_raw_key_owned(k, None),
+                    F::encode_raw_key_owned(k, ts),
                     F::encode_raw_value_owned(raw_value),
                 )
             })
-            .collect();
-        Ok(modifies)
+            .collect()
     }
 
     /// Write some keys to the storage in a batch.
@@ -1949,22 +1966,40 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
             self.max_key_size,
             callback
         );
+        Self::raw_check_ttl(pairs.len(), &ttls)?;
+        let provider = self.causal_ts_provider.clone();
+        let engine = self.engine.clone();
+        let concurrency_manager = self.concurrency_manager.clone();
+        let (cb, f) = paired_future_callback();
+        self.sched_raw_command(async move {
+            let ts = Self::get_causal_ts_from_provider(provider);
+            if let Err(e) = ts {
+                return callback(Err(e));
+            }
+            let modifies = Self::raw_batch_put_requests_to_modifies(cf, pairs, ttls, ts.unwrap());
+            let key_guard = concurrency_manager.lock_key(modifies[0].key()).await;
+            let mut batch = WriteData::from_modifies(modifies);
+            batch.set_allowed_on_disk_almost_full();
 
-        let modifies = Self::raw_batch_put_requests_to_modifies(cf, pairs, ttls)?;
-        let mut batch = WriteData::from_modifies(modifies);
-        batch.set_allowed_on_disk_almost_full();
-
-        self.engine.async_write(
-            &ctx,
-            batch,
-            Box::new(|res| callback(res.map_err(Error::from))),
-        )?;
-        KV_COMMAND_COUNTER_VEC_STATIC.raw_batch_put.inc();
-        Ok(())
+            let async_ret = engine.async_write(
+                &ctx,
+                batch,
+                Box::new(|res| {
+                    drop(key_guard);
+                    cb(res.map_err(Error::from))
+                }),
+            );
+            let v: Result<()> = match async_ret {
+                Err(e) => Err(Error::from(e)),
+                Ok(_) => f.await.unwrap(),
+            };
+            KV_COMMAND_COUNTER_VEC_STATIC.raw_batch_put.inc();
+            callback(v)
+        })
     }
 
-    fn raw_delete_request_to_modify(cf: CfName, key: Vec<u8>) -> Modify {
-        let key = F::encode_raw_key_owned(key, None);
+    fn raw_delete_request_to_modify(cf: CfName, key: Vec<u8>, ts: Option<TimeStamp>) -> Modify {
+        let key = F::encode_raw_key_owned(key, ts);
         match F::TAG {
             ApiVersion::V2 => Modify::Put(cf, key, ApiV2::ENCODED_LOGICAL_DELETE.to_vec()),
             _ => Modify::Delete(cf, key),
@@ -1989,18 +2024,36 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
         )?;
 
         check_key_size!(Some(&key).into_iter(), self.max_key_size, callback);
+        let cf = Self::rawkv_cf(&cf, self.api_version)?;
+        let provider = self.causal_ts_provider.clone();
+        let engine = self.engine.clone();
+        let concurrency_manager = self.concurrency_manager.clone();
+        let (cb, f) = paired_future_callback();
+        self.sched_raw_command(async move {
+            let ts = Self::get_causal_ts_from_provider(provider);
+            if let Err(e) = ts {
+                return callback(Err(e));
+            }
+            let m = Self::raw_delete_request_to_modify(cf, key, ts.unwrap());
+            let key_guard = concurrency_manager.lock_key(m.key()).await;
+            let mut batch = WriteData::from_modifies(vec![m]);
+            batch.set_allowed_on_disk_almost_full();
 
-        let m = Self::raw_delete_request_to_modify(Self::rawkv_cf(&cf, self.api_version)?, key);
-        let mut batch = WriteData::from_modifies(vec![m]);
-        batch.set_allowed_on_disk_almost_full();
-
-        self.engine.async_write(
-            &ctx,
-            batch,
-            Box::new(|res| callback(res.map_err(Error::from))),
-        )?;
-        KV_COMMAND_COUNTER_VEC_STATIC.raw_delete.inc();
-        Ok(())
+            let async_ret = engine.async_write(
+                &ctx,
+                batch,
+                Box::new(|res| {
+                    drop(key_guard);
+                    cb(res.map_err(Error::from))
+                }),
+            );
+            let v: Result<()> = match async_ret {
+                Err(e) => Err(Error::from(e)),
+                Ok(_) => f.await.unwrap(),
+            };
+            KV_COMMAND_COUNTER_VEC_STATIC.raw_delete.inc();
+            callback(v)
+        })
     }
 
     /// Delete all raw keys in [`start_key`, `end_key`).
@@ -2061,21 +2114,39 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
 
         let cf = Self::rawkv_cf(&cf, self.api_version)?;
         check_key_size!(keys.iter(), self.max_key_size, callback);
+        let provider = self.causal_ts_provider.clone();
+        let engine = self.engine.clone();
+        let concurrency_manager = self.concurrency_manager.clone();
+        let (cb, f) = paired_future_callback();
+        self.sched_raw_command(async move {
+            let ts = Self::get_causal_ts_from_provider(provider);
+            if let Err(e) = ts {
+                return callback(Err(e));
+            }
+            let ts = ts.unwrap();
+            let modifies: Vec<Modify> = keys
+                .into_iter()
+                .map(|k| Self::raw_delete_request_to_modify(cf, k, ts))
+                .collect();
+            let key_guard = concurrency_manager.lock_key(modifies[0].key()).await;
+            let mut batch = WriteData::from_modifies(modifies);
+            batch.set_allowed_on_disk_almost_full();
 
-        let modifies = keys
-            .into_iter()
-            .map(|k| Self::raw_delete_request_to_modify(cf, k))
-            .collect();
-        let mut batch = WriteData::from_modifies(modifies);
-        batch.set_allowed_on_disk_almost_full();
-
-        self.engine.async_write(
-            &ctx,
-            batch,
-            Box::new(|res| callback(res.map_err(Error::from))),
-        )?;
-        KV_COMMAND_COUNTER_VEC_STATIC.raw_batch_delete.inc();
-        Ok(())
+            let async_ret = engine.async_write(
+                &ctx,
+                batch,
+                Box::new(|res| {
+                    drop(key_guard);
+                    cb(res.map_err(Error::from))
+                }),
+            );
+            let v: Result<()> = match async_ret {
+                Err(e) => Err(Error::from(e)),
+                Ok(_) => f.await.unwrap(),
+            };
+            KV_COMMAND_COUNTER_VEC_STATIC.raw_batch_delete.inc();
+            callback(v)
+        })
     }
 
     /// Scan raw keys in a range.
@@ -2474,11 +2545,24 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
         if !F::IS_TTL_ENABLED && ttl != 0 {
             return Err(Error::from(ErrorInner::TtlNotEnabled));
         }
-
-        let key = F::encode_raw_key_owned(key, None);
-        let cmd =
-            RawCompareAndSwap::new(cf, key, previous_value, value, ttl, self.api_version, ctx);
-        self.sched_txn_command(cmd, cb)
+        let provider = self.causal_ts_provider.clone();
+        let concurrency_manager = self.concurrency_manager.clone();
+        let sched = self.get_scheduler();
+        let api_version = self.api_version;
+        self.sched_raw_command(async move {
+            let ts = Self::get_causal_ts_from_provider(provider);
+            if let Err(e) = ts {
+                return cb(Err(e));
+            }
+            let key = F::encode_raw_key_owned(key, ts.unwrap());
+            let key_guard = concurrency_manager.lock_key(&key).await;
+            let cmd =
+                RawCompareAndSwap::new(cf, key, previous_value, value, ttl, api_version, ctx);
+            Self::sched_raw_atomic_command(sched, cmd, Box::new(|res| {
+                drop(key_guard);
+                cb(res.map_err(Error::from))
+            }));
+        })
     }
 
     pub fn raw_batch_put_atomic(
@@ -2497,9 +2581,23 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
         )?;
 
         let cf = Self::rawkv_cf(&cf, self.api_version)?;
-        let modifies = Self::raw_batch_put_requests_to_modifies(cf, pairs, ttls)?;
-        let cmd = RawAtomicStore::new(cf, modifies, ctx);
-        self.sched_txn_command(cmd, callback)
+        Self::raw_check_ttl(pairs.len(), &ttls)?;
+        let provider = self.causal_ts_provider.clone();
+        let concurrency_manager = self.concurrency_manager.clone();
+        let sched = self.get_scheduler();
+        self.sched_raw_command(async move {
+            let ts = Self::get_causal_ts_from_provider(provider);
+            if let Err(e) = ts {
+                return callback(Err(e));
+            }
+            let modifies = Self::raw_batch_put_requests_to_modifies(cf, pairs, ttls, ts.unwrap());
+            let key_guard = concurrency_manager.lock_key(modifies[0].key()).await;
+            let cmd = RawAtomicStore::new(cf, modifies, ctx);
+            Self::sched_raw_atomic_command(sched, cmd, Box::new(|res| {
+                drop(key_guard);
+                callback(res.map_err(Error::from))
+            }));
+        })
     }
 
     pub fn raw_batch_delete_atomic(
@@ -2517,12 +2615,26 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
         )?;
 
         let cf = Self::rawkv_cf(&cf, self.api_version)?;
-        let modifies = keys
-            .into_iter()
-            .map(|k| Self::raw_delete_request_to_modify(cf, k))
-            .collect();
-        let cmd = RawAtomicStore::new(cf, modifies, ctx);
-        self.sched_txn_command(cmd, callback)
+        let provider = self.causal_ts_provider.clone();
+        let concurrency_manager = self.concurrency_manager.clone();
+        let sched = self.get_scheduler();
+        self.sched_raw_command(async move {
+            let ts = Self::get_causal_ts_from_provider(provider);
+            if let Err(e) = ts {
+                return callback(Err(e));
+            }
+            let ts = ts.unwrap();
+            let modifies: Vec<Modify> = keys
+                .into_iter()
+                .map(|k| Self::raw_delete_request_to_modify(cf, k, ts))
+                .collect();
+            let key_guard = concurrency_manager.lock_key(modifies[0].key()).await;
+            let cmd = RawAtomicStore::new(cf, modifies, ctx);
+            Self::sched_raw_atomic_command(sched, cmd, Box::new(|res| {
+                drop(key_guard);
+                callback(res.map_err(Error::from))
+            }));
+        })
     }
 
     pub fn raw_checksum(
