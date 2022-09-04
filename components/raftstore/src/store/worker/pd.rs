@@ -31,9 +31,10 @@ use kvproto::{
     replication_modepb::{RegionReplicationStatus, StoreDrAutoSyncStatus},
 };
 use ordered_float::OrderedFloat;
-use pd_client::{merge_bucket_stats, metrics::*, BucketStat, Error, PdClient, RegionStat};
+use pd_client::{merge_bucket_stats, metrics::*, BucketStat, Error, PdClient, RegionStat, RpcClient};
 use prometheus::local::LocalHistogram;
 use raft::eraftpb::ConfChangeType;
+use causal_ts::BatchTsoProvider;
 use resource_metering::{Collector, CollectorGuard, CollectorRegHandle, RawRecords};
 use tikv_util::{
     box_err, debug, error, info,
@@ -903,6 +904,7 @@ where
     health_service: Option<HealthService>,
     curr_health_status: ServingStatus,
     coprocessor_host: CoprocessorHost<EK>,
+    causal_ts_provider: Option<Arc<BatchTsoProvider<RpcClient>>>, // used for rawkv apiv2
 }
 
 impl<EK, ER, T> Runner<EK, ER, T>
@@ -928,6 +930,7 @@ where
         region_read_progress: RegionReadProgressRegistry,
         health_service: Option<HealthService>,
         coprocessor_host: CoprocessorHost<EK>,
+        causal_ts_provider: Option<Arc<BatchTsoProvider<RpcClient>>>, // used for rawkv apiv2
     ) -> Runner<EK, ER, T> {
         // Register the region CPU records collector.
         let mut region_cpu_records_collector = None;
@@ -972,6 +975,7 @@ where
             health_service,
             curr_health_status: ServingStatus::Serving,
             coprocessor_host,
+            causal_ts_provider,
         }
     }
 
@@ -1608,9 +1612,17 @@ where
     ) {
         let pd_client = self.pd_client.clone();
         let concurrency_manager = self.concurrency_manager.clone();
+        let causal_ts_provider = self.causal_ts_provider.clone();
+
         let f = async move {
             let mut success = false;
             while txn_ext.max_ts_sync_status.load(Ordering::SeqCst) == initial_status {
+                //TODO: 1. handle error; 
+                //      2. one rpc is enough.
+                if let Some(causal_ts_provider) = &causal_ts_provider {
+                    causal_ts_provider.flush_ts().await;
+                }
+
                 match pd_client.get_tso().await {
                     Ok(ts) => {
                         concurrency_manager.update_max_ts(ts);

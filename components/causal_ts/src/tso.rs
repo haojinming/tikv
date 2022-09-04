@@ -367,6 +367,10 @@ impl<C: PdClient + 'static> BatchTsoProvider<C> {
         Ok(s)
     }
 
+    pub async fn flush_ts(&self) -> Result<()> {
+        self.renew_tso_batch(true, TsoBatchRenewReason::flush).await
+    }
+
     async fn renew_tso_batch(&self, need_flush: bool, reason: TsoBatchRenewReason) -> Result<()> {
         Self::renew_tso_batch_internal(self.renew_request_tx.clone(), need_flush, reason).await
     }
