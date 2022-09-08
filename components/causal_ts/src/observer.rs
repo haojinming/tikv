@@ -19,5 +19,3 @@ impl<Ts: CausalTsProvider> Clone for CausalObserver<Ts> {
         }
     }
 }
-
-// TODO: should keep region change observer.

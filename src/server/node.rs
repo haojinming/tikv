@@ -7,14 +7,14 @@ use std::{
 };
 
 use api_version::{api_v2::TIDB_RANGES_COMPLEMENT, KvFormat};
-use causal_ts::{BatchTsoProvider, CausalTsProvider};
+use causal_ts::CausalTsProvider;
 use concurrency_manager::ConcurrencyManager;
 use engine_traits::{Engines, Iterable, KvEngine, RaftEngine, DATA_CFS, DATA_KEY_PREFIX_LEN};
 use grpcio_health::HealthService;
 use kvproto::{
     kvrpcpb::ApiVersion, metapb, raft_serverpb::StoreIdent, replication_modepb::ReplicationStatus,
 };
-use pd_client::{Error as PdError, FeatureGate, PdClient, RpcClient, INVALID_ID};
+use pd_client::{Error as PdError, FeatureGate, PdClient, INVALID_ID};
 use raftstore::{
     coprocessor::dispatcher::CoprocessorHost,
     router::{LocalReadRouter, RaftStoreRouter},
@@ -201,7 +201,7 @@ where
     /// bootstrapped yet. Then it spawns a thread to run the raftstore in
     /// background.
     #[allow(clippy::too_many_arguments)]
-    pub fn start<T>(
+    pub fn start<T, Ts>(
         &mut self,
         engines: Engines<EK, ER>,
         trans: T,
@@ -214,10 +214,11 @@ where
         auto_split_controller: AutoSplitController,
         concurrency_manager: ConcurrencyManager,
         collector_reg_handle: CollectorRegHandle,
-        causal_ts_provider: Option<Arc<BatchTsoProvider<RpcClient>>>, // used for rawkv apiv2
+        causal_ts_provider: Option<Arc<Ts>>, // used for rawkv apiv2
     ) -> Result<()>
     where
         T: Transport + 'static,
+        Ts: CausalTsProvider + 'static,
     {
         let store_id = self.id();
         {
@@ -479,7 +480,7 @@ where
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn start_store<T>(
+    fn start_store<T, Ts>(
         &mut self,
         store_id: u64,
         engines: Engines<EK, ER>,
@@ -493,10 +494,11 @@ where
         auto_split_controller: AutoSplitController,
         concurrency_manager: ConcurrencyManager,
         collector_reg_handle: CollectorRegHandle,
-        causal_ts_provider: Option<Arc<BatchTsoProvider<RpcClient>>>, // used for rawkv apiv2
+        causal_ts_provider: Option<Arc<Ts>>, // used for rawkv apiv2
     ) -> Result<()>
     where
         T: Transport + 'static,
+        Ts: CausalTsProvider + 'static,
     {
         info!("start raft store thread"; "store_id" => store_id);
 

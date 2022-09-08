@@ -5,7 +5,7 @@ use api_version::{match_template_api_version, KvFormat, RawValue};
 use engine_traits::{raw_ttl::ttl_to_expire_ts, CfName};
 use kvproto::kvrpcpb::ApiVersion;
 use raw::RawStore;
-use tikv_kv::Statistics;
+use tikv_kv::{SnapshotExt, Statistics};
 use txn_types::{Key, TimeStamp, Value};
 
 use crate::storage::{
@@ -17,7 +17,7 @@ use crate::storage::{
             Command, CommandExt, ResponsePolicy, TypedCommand, WriteCommand, WriteContext,
             WriteResult,
         },
-        Result,
+        ErrorInner, Result,
     },
     ProcessResult, Snapshot,
 };
@@ -53,6 +53,14 @@ impl CommandExt for RawCompareAndSwap {
 
 impl<S: Snapshot, L: LockManager> WriteCommand<S, L> for RawCompareAndSwap {
     fn process_write(self, snapshot: S, _: WriteContext<'_, L>) -> Result<WriteResult> {
+        if !snapshot.ext().is_max_ts_synced() {
+            return Err(ErrorInner::MaxTimestampNotSynced {
+                region_id: self.ctx.get_region_id(),
+                start_ts: TimeStamp::zero(),
+            }
+            .into());
+        }
+
         let (cf, mut key, value, previous_value, ctx) =
             (self.cf, self.key, self.value, self.previous_value, self.ctx);
         let mut data = vec![];

@@ -2,6 +2,7 @@
 
 // #[PerformanceCriticalPath]
 use engine_traits::CfName;
+use tikv_kv::SnapshotExt;
 use txn_types::TimeStamp;
 
 use crate::storage::{
@@ -12,7 +13,7 @@ use crate::storage::{
             Command, CommandExt, ResponsePolicy, TypedCommand, WriteCommand, WriteContext,
             WriteResult,
         },
-        Result,
+        ErrorInner, Result,
     },
     ProcessResult, Snapshot,
 };
@@ -41,7 +42,15 @@ impl CommandExt for RawAtomicStore {
 }
 
 impl<S: Snapshot, L: LockManager> WriteCommand<S, L> for RawAtomicStore {
-    fn process_write(self, _: S, _: WriteContext<'_, L>) -> Result<WriteResult> {
+    fn process_write(self, snapshot: S, _: WriteContext<'_, L>) -> Result<WriteResult> {
+        if !snapshot.ext().is_max_ts_synced() {
+            return Err(ErrorInner::MaxTimestampNotSynced {
+                region_id: self.ctx.get_region_id(),
+                start_ts: TimeStamp::zero(),
+            }
+            .into());
+        }
+
         let rows = self.mutations.len();
         let (mut mutations, ctx) = (self.mutations, self.ctx);
         if let Some(ts) = self.data_ts {

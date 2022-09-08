@@ -19,7 +19,7 @@ use batch_system::{
     BasicMailbox, BatchRouter, BatchSystem, Config as BatchSystemConfig, Fsm, HandleResult,
     HandlerBuilder, PollHandler, Priority,
 };
-use causal_ts::BatchTsoProvider;
+use causal_ts::CausalTsProvider;
 use collections::{HashMap, HashMapEntry, HashSet};
 use concurrency_manager::ConcurrencyManager;
 use crossbeam::channel::{unbounded, TryRecvError, TrySendError};
@@ -39,7 +39,7 @@ use kvproto::{
     raft_serverpb::{ExtraMessageType, PeerState, RaftMessage, RegionLocalState},
     replication_modepb::{ReplicationMode, ReplicationStatus},
 };
-use pd_client::{Feature, FeatureGate, PdClient, RpcClient};
+use pd_client::{Feature, FeatureGate, PdClient};
 use protobuf::Message;
 use raft::StateRole;
 use resource_metering::CollectorRegHandle;
@@ -1431,7 +1431,7 @@ impl<EK: KvEngine, ER: RaftEngine> RaftBatchSystem<EK, ER> {
     }
 
     // TODO: reduce arguments
-    pub fn spawn<T: Transport + 'static, C: PdClient + 'static>(
+    pub fn spawn<T: Transport + 'static, C: PdClient + 'static, Ts: CausalTsProvider + 'static>(
         &mut self,
         meta: metapb::Store,
         cfg: Arc<VersionTrack<Config>>,
@@ -1450,7 +1450,7 @@ impl<EK: KvEngine, ER: RaftEngine> RaftBatchSystem<EK, ER> {
         concurrency_manager: ConcurrencyManager,
         collector_reg_handle: CollectorRegHandle,
         health_service: Option<HealthService>,
-        causal_ts_provider: Option<Arc<BatchTsoProvider<RpcClient>>>, // used for rawkv apiv2
+        causal_ts_provider: Option<Arc<Ts>>, // used for rawkv apiv2
     ) -> Result<()> {
         assert!(self.workers.is_none());
         // TODO: we can get cluster meta regularly too later.
@@ -1580,7 +1580,7 @@ impl<EK: KvEngine, ER: RaftEngine> RaftBatchSystem<EK, ER> {
             write_senders: self.store_writers.senders(),
         };
         let region_peers = builder.init()?;
-        self.start_system::<T, C>(
+        self.start_system::<T, C, Ts>(
             workers,
             region_peers,
             builder,
@@ -1596,7 +1596,11 @@ impl<EK: KvEngine, ER: RaftEngine> RaftBatchSystem<EK, ER> {
         Ok(())
     }
 
-    fn start_system<T: Transport + 'static, C: PdClient + 'static>(
+    fn start_system<
+        T: Transport + 'static,
+        C: PdClient + 'static,
+        Ts: CausalTsProvider + 'static,
+    >(
         &mut self,
         mut workers: Workers<EK, ER>,
         region_peers: Vec<SenderFsmPair<EK, ER>>,
@@ -1608,7 +1612,7 @@ impl<EK: KvEngine, ER: RaftEngine> RaftBatchSystem<EK, ER> {
         collector_reg_handle: CollectorRegHandle,
         region_read_progress: RegionReadProgressRegistry,
         health_service: Option<HealthService>,
-        causal_ts_provider: Option<Arc<BatchTsoProvider<RpcClient>>>, // used for rawkv apiv2
+        causal_ts_provider: Option<Arc<Ts>>, // used for rawkv apiv2
     ) -> Result<()> {
         let cfg = builder.cfg.value().clone();
         let store = builder.store.clone();

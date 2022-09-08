@@ -1865,6 +1865,27 @@ impl<E: Engine, L: LockManager, F: KvFormat, Ts: CausalTsProvider + 'static> Sto
         }
     }
 
+    async fn check_causal_ts_synced(ctx: &mut Context) -> Result<()> {
+        let snap_ctx = SnapContext {
+            pb_ctx: &ctx,
+            ..Default::default()
+        };
+        let snapshot = 
+            Self::with_tls_engine(|engine| Self::snapshot(engine, snap_ctx)).await?;
+
+        if !snapshot.ext().is_max_ts_synced() {
+            return Err(Error::from(txn::Error::from(TxnError::MaxTimestampNotSynced {
+                    region_id: ctx.get_region_id(),
+                    start_ts: TimeStamp::zero(),
+                })));
+        }
+        let term = snapshot.ext().get_term();
+        if let Some(term) = term {
+            ctx.set_term(term.get());
+        }
+        Ok(())
+    }
+
     async fn get_raw_key_guard(
         ts_provider: &Option<Arc<Ts>>,
         concurrency_manager: ConcurrencyManager,
@@ -1894,7 +1915,7 @@ impl<E: Engine, L: LockManager, F: KvFormat, Ts: CausalTsProvider + 'static> Sto
     /// Write a raw key to the storage.
     pub fn raw_put(
         &self,
-        ctx: Context,
+        mut ctx: Context,
         cf: String,
         key: Vec<u8>,
         value: Vec<u8>,
@@ -1922,22 +1943,9 @@ impl<E: Engine, L: LockManager, F: KvFormat, Ts: CausalTsProvider + 'static> Sto
             }
             let command_duration = tikv_util::time::Instant::now();
 
-            let snap_ctx = SnapContext {
-                pb_ctx: &ctx,
-                ..Default::default()
-            };
-            let snapshot =
-                Self::with_tls_engine(|engine| Self::snapshot(engine, snap_ctx)).await;
-            if let Err(e) = snapshot {
+            if let Err(e) = Self::check_causal_ts_synced(&mut ctx).await {
                 return callback(Err(e));
             }
-            if !snapshot.unwrap().ext().is_max_ts_synced() {
-                return callback(Err(Error::from(txn::Error::from(TxnError::MaxTimestampNotSynced {
-                    region_id: ctx.get_region_id(),
-                    start_ts: TimeStamp::zero(),
-                }))));
-            }
-            
             // get new ts after get key_guard to avoid cdc register_min_ts_event
             // use a smaller ts then ts used here.
             let key_guard = Self::get_raw_key_guard(&provider, concurrency_manager).await;
@@ -2015,7 +2023,7 @@ impl<E: Engine, L: LockManager, F: KvFormat, Ts: CausalTsProvider + 'static> Sto
     /// Write some keys to the storage in a batch.
     pub fn raw_batch_put(
         &self,
-        ctx: Context,
+        mut ctx: Context,
         cf: String,
         pairs: Vec<KvPair>,
         ttls: Vec<u64>,
@@ -2046,26 +2054,11 @@ impl<E: Engine, L: LockManager, F: KvFormat, Ts: CausalTsProvider + 'static> Sto
             if let Err(e) = deadline.check() {
                 return callback(Err(Error::from(e)));
             }
-
-            let snap_ctx = SnapContext {
-                pb_ctx: &ctx,
-                ..Default::default()
-            };
-            let snapshot =
-                Self::with_tls_engine(|engine| Self::snapshot(engine, snap_ctx)).await;
-            if let Err(e) = snapshot {
+            if let Err(e) = Self::check_causal_ts_synced(&mut ctx).await {
                 return callback(Err(e));
             }
 
-            if !snapshot.unwrap().ext().is_max_ts_synced() {
-                return callback(Err(Error::from(txn::Error::from(TxnError::MaxTimestampNotSynced {
-                    region_id: ctx.get_region_id(),
-                    start_ts: TimeStamp::zero(),
-                }))));
-            }
-
             let command_duration = tikv_util::time::Instant::now();
-
             let key_guard = Self::get_raw_key_guard(&provider, concurrency_manager).await;
             if let Err(e) = key_guard {
                 return callback(Err(e));
@@ -2107,7 +2100,7 @@ impl<E: Engine, L: LockManager, F: KvFormat, Ts: CausalTsProvider + 'static> Sto
     /// operations.
     pub fn raw_delete(
         &self,
-        ctx: Context,
+        mut ctx: Context,
         cf: String,
         key: Vec<u8>,
         callback: Callback<()>,
@@ -2125,21 +2118,8 @@ impl<E: Engine, L: LockManager, F: KvFormat, Ts: CausalTsProvider + 'static> Sto
             if let Err(e) = deadline.check() {
                 return callback(Err(Error::from(e)));
             }
-            let snap_ctx = SnapContext {
-                pb_ctx: &ctx,
-                ..Default::default()
-            };
-            let snapshot =
-                Self::with_tls_engine(|engine| Self::snapshot(engine, snap_ctx)).await;
-            if let Err(e) = snapshot {
+            if let Err(e) = Self::check_causal_ts_synced(&mut ctx).await {
                 return callback(Err(e));
-            }
-
-            if !snapshot.unwrap().ext().is_max_ts_synced() {
-                return callback(Err(Error::from(txn::Error::from(TxnError::MaxTimestampNotSynced {
-                    region_id: ctx.get_region_id(),
-                    start_ts: TimeStamp::zero(),
-                }))));
             }
 
             let command_duration = tikv_util::time::Instant::now();
@@ -2229,7 +2209,7 @@ impl<E: Engine, L: LockManager, F: KvFormat, Ts: CausalTsProvider + 'static> Sto
     /// operations.
     pub fn raw_batch_delete(
         &self,
-        ctx: Context,
+        mut ctx: Context,
         cf: String,
         keys: Vec<Vec<u8>>,
         callback: Callback<()>,
@@ -2247,21 +2227,8 @@ impl<E: Engine, L: LockManager, F: KvFormat, Ts: CausalTsProvider + 'static> Sto
             if let Err(e) = deadline.check() {
                 return callback(Err(Error::from(e)));
             }
-            let snap_ctx = SnapContext {
-                pb_ctx: &ctx,
-                ..Default::default()
-            };
-            let snapshot =
-                Self::with_tls_engine(|engine| Self::snapshot(engine, snap_ctx)).await;
-            if let Err(e) = snapshot { 
+            if let Err(e) = Self::check_causal_ts_synced(&mut ctx).await {
                 return callback(Err(e));
-            }
-
-            if !snapshot.unwrap().ext().is_max_ts_synced() {
-                return callback(Err(Error::from(txn::Error::from(TxnError::MaxTimestampNotSynced {
-                    region_id: ctx.get_region_id(),
-                    start_ts: TimeStamp::zero(),
-                }))));
             }
 
             let command_duration = tikv_util::time::Instant::now();
@@ -2700,22 +2667,6 @@ impl<E: Engine, L: LockManager, F: KvFormat, Ts: CausalTsProvider + 'static> Sto
             // to "lock" other concurrent requests. TODO: Merge the two locks
             // into one to simplify the process. Same to other raw atomic
             // commands.
-            let snap_ctx = SnapContext {
-                pb_ctx: &ctx,
-                ..Default::default()
-            };
-            // TODO: Get snapshot twice. Txn scheduler will get snapshot again.
-            let snapshot =
-                Self::with_tls_engine(|engine| Self::snapshot(engine, snap_ctx)).await;
-            if let Err(e) = snapshot {
-                return cb(Err(e));
-            }
-            if !snapshot.unwrap().ext().is_max_ts_synced() {
-                return cb(Err(Error::from(txn::Error::from(TxnError::MaxTimestampNotSynced {
-                    region_id: ctx.get_region_id(),
-                    start_ts: TimeStamp::zero(),
-                }))));
-            }
             let key_guard = Self::get_raw_key_guard(&provider, concurrency_manager).await;
             if let Err(e) = key_guard {
                 return cb(Err(e));

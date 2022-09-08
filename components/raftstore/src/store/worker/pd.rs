@@ -14,6 +14,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use causal_ts::CausalTsProvider;
 use collections::{HashMap, HashSet};
 use concurrency_manager::ConcurrencyManager;
 use engine_traits::{KvEngine, RaftEngine};
@@ -31,10 +32,9 @@ use kvproto::{
     replication_modepb::{RegionReplicationStatus, StoreDrAutoSyncStatus},
 };
 use ordered_float::OrderedFloat;
-use pd_client::{merge_bucket_stats, metrics::*, BucketStat, Error, PdClient, RegionStat, RpcClient};
+use pd_client::{merge_bucket_stats, metrics::*, BucketStat, Error, PdClient, RegionStat};
 use prometheus::local::LocalHistogram;
 use raft::eraftpb::ConfChangeType;
-use causal_ts::BatchTsoProvider;
 use resource_metering::{Collector, CollectorGuard, CollectorRegHandle, RawRecords};
 use tikv_util::{
     box_err, debug, error, info,
@@ -868,11 +868,12 @@ where
     }
 }
 
-pub struct Runner<EK, ER, T>
+pub struct Runner<EK, ER, T, Ts>
 where
     EK: KvEngine,
     ER: RaftEngine,
     T: PdClient + 'static,
+    Ts: CausalTsProvider,
 {
     store_id: u64,
     pd_client: Arc<T>,
@@ -904,14 +905,15 @@ where
     health_service: Option<HealthService>,
     curr_health_status: ServingStatus,
     coprocessor_host: CoprocessorHost<EK>,
-    causal_ts_provider: Option<Arc<BatchTsoProvider<RpcClient>>>, // used for rawkv apiv2
+    causal_ts_provider: Option<Arc<Ts>>, // used for rawkv apiv2
 }
 
-impl<EK, ER, T> Runner<EK, ER, T>
+impl<EK, ER, T, Ts> Runner<EK, ER, T, Ts>
 where
     EK: KvEngine,
     ER: RaftEngine,
     T: PdClient + 'static,
+    Ts: CausalTsProvider + 'static,
 {
     const INTERVAL_DIVISOR: u32 = 2;
 
@@ -930,8 +932,8 @@ where
         region_read_progress: RegionReadProgressRegistry,
         health_service: Option<HealthService>,
         coprocessor_host: CoprocessorHost<EK>,
-        causal_ts_provider: Option<Arc<BatchTsoProvider<RpcClient>>>, // used for rawkv apiv2
-    ) -> Runner<EK, ER, T> {
+        causal_ts_provider: Option<Arc<Ts>>, // used for rawkv apiv2
+    ) -> Runner<EK, ER, T, Ts> {
         // Register the region CPU records collector.
         let mut region_cpu_records_collector = None;
         if auto_split_controller
@@ -1616,33 +1618,49 @@ where
 
         let f = async move {
             let mut success = false;
+            let mut update_ts = |ts| {
+                concurrency_manager.update_max_ts(ts);
+                // Set the least significant bit to 1 to mark it as synced.
+                success = txn_ext
+                    .max_ts_sync_status
+                    .compare_exchange(
+                        initial_status,
+                        initial_status | 1,
+                        Ordering::SeqCst,
+                        Ordering::SeqCst,
+                    )
+                    .is_ok();
+            };
             while txn_ext.max_ts_sync_status.load(Ordering::SeqCst) == initial_status {
-                //TODO: 1. handle error; 
-                //      2. one rpc is enough.
                 if let Some(causal_ts_provider) = &causal_ts_provider {
-                    causal_ts_provider.flush_ts().await;
-                }
-
-                match pd_client.get_tso().await {
-                    Ok(ts) => {
-                        concurrency_manager.update_max_ts(ts);
-                        // Set the least significant bit to 1 to mark it as synced.
-                        success = txn_ext
-                            .max_ts_sync_status
-                            .compare_exchange(
-                                initial_status,
-                                initial_status | 1,
-                                Ordering::SeqCst,
-                                Ordering::SeqCst,
-                            )
-                            .is_ok();
-                        break;
+                    if let Err(e) = causal_ts_provider.async_flush().await {
+                        warn!("failed to update max timestamp for region {}: {:?}", region_id, e);
+                    } else {
+                        match causal_ts_provider.async_get_ts().await {
+                            Ok(ts) => {
+                                update_ts(ts);
+                                break;
+                            }
+                            Err(e) => {
+                                warn!(
+                                    "failed to update max timestamp for region {}: {:?}",
+                                    region_id, e
+                                );
+                            }
+                        }
                     }
-                    Err(e) => {
-                        warn!(
-                            "failed to update max timestamp for region {}: {:?}",
-                            region_id, e
-                        );
+                } else {
+                    match pd_client.get_tso().await {
+                        Ok(ts) => {
+                            update_ts(ts);
+                            break;
+                        }
+                        Err(e) => {
+                            warn!(
+                                "failed to update max timestamp for region {}: {:?}",
+                                region_id, e
+                            );
+                        }
                     }
                 }
             }
@@ -1797,11 +1815,12 @@ fn calculate_region_cpu_records(
     }
 }
 
-impl<EK, ER, T> Runnable for Runner<EK, ER, T>
+impl<EK, ER, T, Ts> Runnable for Runner<EK, ER, T, Ts>
 where
     EK: KvEngine,
     ER: RaftEngine,
     T: PdClient,
+    Ts: CausalTsProvider + 'static,
 {
     type Task = Task<EK, ER>;
 
@@ -2043,11 +2062,12 @@ where
     }
 }
 
-impl<EK, ER, T> RunnableWithTimer for Runner<EK, ER, T>
+impl<EK, ER, T, Ts> RunnableWithTimer for Runner<EK, ER, T, Ts>
 where
     EK: KvEngine,
     ER: RaftEngine,
     T: PdClient + 'static,
+    Ts: CausalTsProvider + 'static,
 {
     fn on_timeout(&mut self) {
         // The health status is recovered to serving as long as any tick
