@@ -233,7 +233,6 @@ mod tests {
     use std::sync::mpsc::channel;
 
     use api_version::KvFormat;
-    use causal_ts::CausalTsProvider;
     use kvproto::kvrpcpb::Context;
     use tikv_kv::Engine;
     use txn_types::Mutation;
@@ -246,7 +245,7 @@ mod tests {
     };
 
     fn prewrite_data<E: Engine, L: LockManager, F: KvFormat>(
-        storage: &Storage<E, L, F>,
+        storage: &Storage<E, L, F, causal_ts::tests::TestProvider>,
         primary: Vec<u8>,
         data: Vec<(Vec<u8>, Vec<u8>)>,
         start_ts: u64,
@@ -278,7 +277,7 @@ mod tests {
     }
 
     fn rollback_data<E: Engine, L: LockManager, F: KvFormat>(
-        storage: &Storage<E, L, F>,
+        storage: &Storage<E, L, F, causal_ts::tests::TestProvider>,
         data: Vec<Vec<u8>>,
         start_ts: u64,
     ) {
@@ -301,7 +300,7 @@ mod tests {
     }
 
     fn write_data<E: Engine, L: LockManager, F: KvFormat>(
-        storage: &Storage<E, L, F>,
+        storage: &Storage<E, L, F, causal_ts::tests::TestProvider>,
         data: Vec<(Vec<u8>, Vec<u8>)>,
         ts: u64,
     ) {

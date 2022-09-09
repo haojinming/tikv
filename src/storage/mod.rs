@@ -157,7 +157,10 @@ pub type Callback<T> = Box<dyn FnOnce(Result<T>) + Send>;
 /// that multiple versions can be saved at the same time. Raw operations use raw
 /// keys, which are saved directly to the engine without memcomparable- encoding
 /// and appending timestamp.
-pub struct Storage<E: Engine, L: LockManager, F: KvFormat> {
+pub struct Storage<E: Engine, L: LockManager, F: KvFormat, Ts = BatchTsoProvider<RpcClient>>
+where
+    Ts: CausalTsProvider + 'static,
+{
     // TODO: Too many Arcs, would be slow when clone.
     engine: E,
 
@@ -180,7 +183,7 @@ pub struct Storage<E: Engine, L: LockManager, F: KvFormat> {
 
     api_version: ApiVersion, // TODO: remove this. Use `Api` instead.
 
-    causal_ts_provider: Option<Arc<BatchTsoProvider<RpcClient>>>,
+    causal_ts_provider: Option<Arc<Ts>>,
 
     quota_limiter: Arc<QuotaLimiter>,
 
@@ -191,8 +194,8 @@ pub struct Storage<E: Engine, L: LockManager, F: KvFormat> {
 /// To be convenience for test cases unrelated to RawKV.
 pub type StorageApiV1<E, L> = Storage<E, L, ApiV1>;
 
-impl<E: Engine, L: LockManager, F: KvFormat> Clone
-    for Storage<E, L, F>
+impl<E: Engine, L: LockManager, F: KvFormat, Ts: CausalTsProvider + 'static> Clone
+    for Storage<E, L, F, Ts>
 {
     #[inline]
     fn clone(&self) -> Self {
@@ -218,24 +221,24 @@ impl<E: Engine, L: LockManager, F: KvFormat> Clone
     }
 }
 
-impl<E: Engine, L: LockManager, F: KvFormat> Drop
-    for Storage<E, L, F>
-{
-    #[inline]
-    fn drop(&mut self) {
-        let refs = self.refs.fetch_sub(1, atomic::Ordering::SeqCst);
+// impl<E: Engine, L: LockManager, F: KvFormat> Drop
+//     for Storage<E, L, F>
+// {
+//     #[inline]
+//     fn drop(&mut self) {
+//         let refs = self.refs.fetch_sub(1, atomic::Ordering::SeqCst);
 
-        trace!(
-            "Storage de-referenced"; "original_ref" => refs
-        );
+//         trace!(
+//             "Storage de-referenced"; "original_ref" => refs
+//         );
 
-        if refs != 1 {
-            return;
-        }
+//         if refs != 1 {
+//             return;
+//         }
 
-        info!("Storage stopped.");
-    }
-}
+//         info!("Storage stopped.");
+//     }
+// }
 
 macro_rules! check_key_size {
     ($key_iter:expr, $max_key_size:expr, $callback:ident) => {
@@ -252,7 +255,7 @@ macro_rules! check_key_size {
     };
 }
 
-impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
+impl<E: Engine, L: LockManager, F: KvFormat, Ts: CausalTsProvider + 'static> Storage<E, L, F, Ts> {
     /// Create a `Storage` from given engine.
     pub fn from_engine<R: FlowStatsReporter>(
         engine: E,
@@ -266,7 +269,7 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
         resource_tag_factory: ResourceTagFactory,
         quota_limiter: Arc<QuotaLimiter>,
         feature_gate: FeatureGate,
-        causal_ts_provider: Option<Arc<BatchTsoProvider<RpcClient>>>,
+        causal_ts_provider: Option<Arc<Ts>>,
     ) -> Result<Self> {
         assert_eq!(config.api_version(), F::TAG, "Api version not match");
 
@@ -1851,7 +1854,7 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
         }
     }
 
-    fn get_causal_ts(ts_provider: &Option<Arc<BatchTsoProvider<RpcClient>>>) -> Result<Option<TimeStamp>> {
+    fn get_causal_ts(ts_provider: &Option<Arc<Ts>>) -> Result<Option<TimeStamp>> {
         if let Some(p) = ts_provider {
             match p.get_ts() {
                 Ok(ts) => Ok(Some(ts)),
@@ -1863,7 +1866,7 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
     }
 
     async fn get_raw_key_guard(
-        ts_provider: &Option<Arc<BatchTsoProvider<RpcClient>>>,
+        ts_provider: &Option<Arc<Ts>>,
         concurrency_manager: ConcurrencyManager,
     ) -> Result<Option<KeyHandleGuard>> {
         // NOTE: the ts cannot be reused as timestamp of data key.
@@ -3102,25 +3105,13 @@ impl<E: Engine, L: LockManager, F: KvFormat> TestStorageBuilder<E, L, F> {
     }
 
     /// Build a `Storage<E>`.
-    pub fn build(self) -> Result<Storage<E, L, F>> {
+    pub fn build(self) -> Result<Storage<E, L, F, causal_ts::tests::TestProvider>> {
         let read_pool = build_read_pool_for_test(
             &crate::config::StorageReadPoolConfig::default_for_test(),
             self.engine.clone(),
         );
         let ts_provider = if F::TAG == ApiVersion::V2 {
-            let server = test_pd::Server::new(1);
-            let eps = server.bind_addrs();
-            let cfg = test_pd::util::new_config(eps);
-            let env = Arc::new(grpcio::EnvBuilder::new().cq_count(1).build());
-            let mgr = Arc::new(security::SecurityManager::new(&security::SecurityConfig::default()).unwrap());
-            let client = RpcClient::new(&cfg, Some(env.clone()), mgr.clone()).unwrap();
-            let ts_provider = futures::executor::block_on(BatchTsoProvider::new_opt(
-                Arc::new(client),
-                std::time::Duration::ZERO,
-                std::time::Duration::from_secs(3),
-                100,
-                8192,
-            )).unwrap();
+            let ts_provider = causal_ts::tests::TestProvider::default();
             Some(Arc::new(ts_provider))
         } else {
             None
@@ -3148,7 +3139,7 @@ impl<E: Engine, L: LockManager, F: KvFormat> TestStorageBuilder<E, L, F> {
     pub fn build_for_txn(
         self,
         txn_ext: Arc<TxnExt>,
-    ) -> Result<Storage<TxnTestEngine<E>, L, F>> {
+    ) -> Result<Storage<TxnTestEngine<E>, L, F, causal_ts::tests::TestProvider>> {
         let engine = TxnTestEngine {
             engine: self.engine,
             txn_ext,
@@ -3316,8 +3307,9 @@ pub mod test_util {
         E: Engine,
         L: LockManager,
         F: KvFormat,
+        Ts: CausalTsProvider + 'static,
     >(
-        storage: &Storage<E, L, F>,
+        storage: &Storage<E, L, F, Ts>,
         key: Key,
         start_ts: u64,
         for_update_ts: u64,
@@ -5533,7 +5525,7 @@ mod tests {
 
     fn run_raw_batch_put<F: KvFormat>(
         for_cas: bool,
-        storage: &Storage<RocksEngine, DummyLockManager, F>,
+        storage: &Storage<RocksEngine, DummyLockManager, F, causal_ts::tests::TestProvider>,
         ctx: Context,
         kvpairs: Vec<KvPair>,
         ttls: Vec<u64>,
@@ -5741,7 +5733,7 @@ mod tests {
 
     fn run_raw_batch_delete<F: KvFormat>(
         for_cas: bool,
-        storage: &Storage<RocksEngine, DummyLockManager, F>,
+        storage: &Storage<RocksEngine, DummyLockManager, F, causal_ts::tests::TestProvider>,
         ctx: Context,
         keys: Vec<Vec<u8>>,
         cb: Callback<()>,

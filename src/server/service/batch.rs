@@ -2,6 +2,7 @@
 
 // #[PerformanceCriticalPath]
 use api_version::KvFormat;
+use causal_ts::CausalTsProvider;
 use kvproto::kvrpcpb::*;
 use tikv_util::{future::poll_future_notify, mpsc::batch::Sender, time::Instant};
 use tracker::{with_tls_tracker, RequestInfo, RequestType, Tracker, TrackerToken, GLOBAL_TRACKERS};
@@ -71,9 +72,9 @@ impl ReqBatcher {
         self.raw_get_ids.push(id);
     }
 
-    pub fn maybe_commit<E: Engine, L: LockManager, F: KvFormat>(
+    pub fn maybe_commit<E: Engine, L: LockManager, F: KvFormat, Ts: CausalTsProvider + 'static>(
         &mut self,
-        storage: &Storage<E, L, F>,
+        storage: &Storage<E, L, F, Ts>,
         tx: &Sender<MeasuredSingleResponse>,
     ) {
         if self.gets.len() >= self.batch_size {
@@ -90,9 +91,9 @@ impl ReqBatcher {
         }
     }
 
-    pub fn commit<E: Engine, L: LockManager, F: KvFormat>(
+    pub fn commit<E: Engine, L: LockManager, F: KvFormat, Ts: CausalTsProvider + 'static>(
         self,
-        storage: &Storage<E, L, F>,
+        storage: &Storage<E, L, F, Ts>,
         tx: &Sender<MeasuredSingleResponse>,
     ) {
         if !self.gets.is_empty() {
@@ -225,8 +226,9 @@ fn future_batch_get_command<
     E: Engine,
     L: LockManager,
     F: KvFormat,
+    Ts: CausalTsProvider + 'static,
 >(
-    storage: &Storage<E, L, F>,
+    storage: &Storage<E, L, F, Ts>,
     requests: Vec<u64>,
     gets: Vec<GetRequest>,
     trackers: Vec<TrackerToken>,
@@ -281,8 +283,9 @@ fn future_batch_raw_get_command<
     E: Engine,
     L: LockManager,
     F: KvFormat,
+    Ts: CausalTsProvider + 'static,
 >(
-    storage: &Storage<E, L, F>,
+    storage: &Storage<E, L, F, Ts>,
     requests: Vec<u64>,
     gets: Vec<RawGetRequest>,
     tx: Sender<MeasuredSingleResponse>,

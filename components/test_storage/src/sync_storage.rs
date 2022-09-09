@@ -110,7 +110,7 @@ impl<E: Engine, F: KvFormat> SyncTestStorageBuilder<E, F> {
 #[derive(Clone)]
 pub struct SyncTestStorage<E: Engine, F: KvFormat> {
     gc_worker: GcWorker<E, RaftStoreBlackHole>,
-    store: Storage<E, DummyLockManager, F>,
+    store: Storage<E, DummyLockManager, F, causal_ts::tests::TestProvider>,
 }
 
 /// SyncTestStorage for Api V1

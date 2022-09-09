@@ -154,7 +154,7 @@ pub struct ServerCluster {
     raft_client: RaftClient<AddressMap, RaftStoreBlackHole, RocksEngine>,
     concurrency_managers: HashMap<u64, ConcurrencyManager>,
     env: Arc<Environment>,
-    pub causal_ts_providers: HashMap<u64, Arc<BatchTsoProvider<RpcClient>>>,
+    pub causal_ts_providers: HashMap<u64, Arc<dyn CausalTsProvider>>,
 }
 
 impl ServerCluster {
