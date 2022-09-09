@@ -6,6 +6,7 @@ use engine_rocks::RocksEngine;
 use engine_rocks_helper::sst_recovery::*;
 use engine_traits::{CompactExt, Peekable, CF_DEFAULT};
 use test_raftstore::*;
+use test_pd_client::TestPdClient;
 
 const CHECK_DURATION: Duration = Duration::from_millis(50);
 

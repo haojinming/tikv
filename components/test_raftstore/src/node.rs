@@ -42,6 +42,7 @@ use tikv_util::{
     time::ThreadReadId,
     worker::{Builder as WorkerBuilder, LazyWorker},
 };
+use test_pd_client::TestPdClient;
 
 use super::*;
 use crate::Config;

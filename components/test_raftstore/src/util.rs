@@ -26,10 +26,6 @@ use kvproto::{
     encryptionpb::EncryptionMethod,
     kvrpcpb::{PrewriteRequestPessimisticAction::*, *},
     metapb::{self, RegionEpoch},
-    pdpb::{
-        ChangePeer, ChangePeerV2, CheckPolicy, Merge, RegionHeartbeatResponse, SplitRegion,
-        TransferLeader,
-    },
     raft_cmdpb::{
         AdminCmdType, AdminRequest, ChangePeerRequest, ChangePeerV2Request, CmdType,
         RaftCmdRequest, RaftCmdResponse, Request, StatusCmdType, StatusRequest,
@@ -53,8 +49,9 @@ use tempfile::TempDir;
 use tikv::{config::*, server::KvEngineFactoryBuilder, storage::point_key_range};
 use tikv_util::{config::*, escape, time::ThreadReadId, worker::LazyWorker, HandyRwLock};
 use txn_types::Key;
+use test_pd_client::TestPdClient;
 
-use crate::{Cluster, Config, ServerCluster, Simulator, TestPdClient};
+use crate::{Cluster, Config, ServerCluster, Simulator};
 
 pub fn must_get(engine: &RocksEngine, cf: &str, key: &[u8], value: Option<&[u8]>) {
     for _ in 1..300 {
@@ -334,57 +331,19 @@ pub fn is_error_response(resp: &RaftCmdResponse) -> bool {
     resp.get_header().has_error()
 }
 
-pub fn new_pd_change_peer(
-    change_type: ConfChangeType,
-    peer: metapb::Peer,
-) -> RegionHeartbeatResponse {
-    let mut change_peer = ChangePeer::default();
-    change_peer.set_change_type(change_type);
-    change_peer.set_peer(peer);
-
-    let mut resp = RegionHeartbeatResponse::default();
-    resp.set_change_peer(change_peer);
-    resp
-}
-
-pub fn new_pd_change_peer_v2(changes: Vec<ChangePeer>) -> RegionHeartbeatResponse {
-    let mut change_peer = ChangePeerV2::default();
-    change_peer.set_changes(changes.into());
-
-    let mut resp = RegionHeartbeatResponse::default();
-    resp.set_change_peer_v2(change_peer);
-    resp
-}
-
-pub fn new_split_region(policy: CheckPolicy, keys: Vec<Vec<u8>>) -> RegionHeartbeatResponse {
-    let mut split_region = SplitRegion::default();
-    split_region.set_policy(policy);
-    split_region.set_keys(keys.into());
-    let mut resp = RegionHeartbeatResponse::default();
-    resp.set_split_region(split_region);
-    resp
-}
-
-pub fn new_pd_transfer_leader(
-    peer: metapb::Peer,
-    peers: Vec<metapb::Peer>,
-) -> RegionHeartbeatResponse {
-    let mut transfer_leader = TransferLeader::default();
-    transfer_leader.set_peer(peer);
-    transfer_leader.set_peers(peers.into());
-
-    let mut resp = RegionHeartbeatResponse::default();
-    resp.set_transfer_leader(transfer_leader);
-    resp
-}
-
-pub fn new_pd_merge_region(target_region: metapb::Region) -> RegionHeartbeatResponse {
-    let mut merge = Merge::default();
-    merge.set_target(target_region);
-
-    let mut resp = RegionHeartbeatResponse::default();
-    resp.set_merge(merge);
-    resp
+// For test when a node is already bootstraped the cluster with the first region
+pub fn bootstrap_with_first_region(pd_client: Arc<TestPdClient>) -> Result<()> {
+    let mut region = metapb::Region::default();
+    region.set_id(1);
+    region.set_start_key(keys::EMPTY_KEY.to_vec());
+    region.set_end_key(keys::EMPTY_KEY.to_vec());
+    region.mut_region_epoch().set_version(INIT_EPOCH_VER);
+    region.mut_region_epoch().set_conf_ver(INIT_EPOCH_CONF_VER);
+    let peer = new_peer(1, 1);
+    region.mut_peers().push(peer);
+    pd_client.add_region(&region);
+    pd_client.set_bootstrap(true);
+    Ok(())
 }
 
 #[derive(Default)]

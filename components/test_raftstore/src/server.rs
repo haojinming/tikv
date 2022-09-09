@@ -29,7 +29,7 @@ use kvproto::{
     raft_serverpb,
     tikvpb::TikvClient,
 };
-use pd_client::{PdClient, RpcClient};
+use pd_client::PdClient;
 use raftstore::{
     coprocessor::{CoprocessorHost, RegionInfoAccessor},
     errors::Error as RaftError,
@@ -78,6 +78,7 @@ use tikv_util::{
 };
 use tokio::runtime::Builder as TokioBuilder;
 use txn_types::TxnExtraScheduler;
+use test_pd_client::TestPdClient;
 
 use super::*;
 use crate::Config;
@@ -372,23 +373,18 @@ impl ServerCluster {
         };
 
         if ApiVersion::V2 == F::TAG {
-            // let server = test_pd::Server::new(1);
-            // let eps = server.bind_addrs();
-            // let pd_cfg = test_pd::util::new_config(eps);
-            // let env = Arc::new(grpcio::EnvBuilder::new().cq_count(1).build());
-            // let mgr = Arc::new(security::SecurityManager::new(&security::SecurityConfig::default()).unwrap());
-            // let client = RpcClient::new(&pd_cfg, Some(env.clone()), mgr.clone()).unwrap();
-            // let causal_ts_provider = Arc::new(
-            //     block_on(causal_ts::BatchTsoProvider::new_opt(
-            //         Arc::new(client),
-            //         cfg.causal_ts.renew_interval.0,
-            //         cfg.causal_ts.available_interval.0,
-            //         cfg.causal_ts.renew_batch_min_size,
-            //         cfg.causal_ts.renew_batch_max_size,
-            //     ))
-            //     .unwrap(),
-            // );
-            let causal_ts_provider: Arc<CausalTs> = Arc::new(causal_ts::tests::TestProvider::default().into());
+            let causal_ts_provider: Arc<CausalTs> = Arc::new(
+                block_on(causal_ts::BatchTsoProvider::new_opt(
+                    self.pd_client.clone(),
+                    cfg.causal_ts.renew_interval.0,
+                    cfg.causal_ts.available_interval.0,
+                    cfg.causal_ts.renew_batch_min_size,
+                    cfg.causal_ts.renew_batch_max_size,
+                ))
+                .unwrap()
+                .into()
+            );
+            // let causal_ts_provider: Arc<CausalTs> = Arc::new(causal_ts::tests::TestProvider::default().into());
             self.causal_ts_providers
                 .insert(node_id, causal_ts_provider.clone());
             let causal_ob = causal_ts::CausalObserver::new(causal_ts_provider);

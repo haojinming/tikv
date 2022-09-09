@@ -53,6 +53,7 @@ use tikv_util::{
     worker::LazyWorker,
     HandyRwLock,
 };
+use test_pd_client::TestPdClient;
 
 use super::*;
 use crate::Config;
