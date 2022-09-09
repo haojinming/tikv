@@ -2,9 +2,6 @@
 
 // #[PerformanceCriticalPath]
 //
-// 1. append ts in txn for cas ?
-// 2. delete range ?
-// 3. diff put & atomic put ?
 
 //! This module contains TiKV's transaction layer. It lowers high-level,
 //! transactional commands to low-level (raw key-value) interactions with
@@ -1854,9 +1851,9 @@ impl<E: Engine, L: LockManager, F: KvFormat, Ts: CausalTsProvider + 'static> Sto
         }
     }
 
-    fn get_causal_ts(ts_provider: &Option<Arc<Ts>>) -> Result<Option<TimeStamp>> {
+    async fn get_causal_ts(ts_provider: &Option<Arc<Ts>>) -> Result<Option<TimeStamp>> {
         if let Some(p) = ts_provider {
-            match p.get_ts() {
+            match p.async_get_ts().await {
                 Ok(ts) => Ok(Some(ts)),
                 Err(e) => Err(box_err!("Fail to get ts: {}", e)),
             }
@@ -1895,7 +1892,7 @@ impl<E: Engine, L: LockManager, F: KvFormat, Ts: CausalTsProvider + 'static> Sto
         // just between the Self::get_causal_ts & concurrency_manager.lock_key,
         // which violate the constraint that resolve-ts should not be larger
         // than timestamp of captured data.
-        let ts = Self::get_causal_ts(ts_provider)?;
+        let ts = Self::get_causal_ts(ts_provider).await?;
         if let Some(ts) = ts {
             let raw_key = vec![api_version::api_v2::RAW_KEY_PREFIX];
             // Make keys for locking by RAW_KEY_PREFIX & ts. RAW_KEY_PREFIX to avoid
@@ -1941,18 +1938,18 @@ impl<E: Engine, L: LockManager, F: KvFormat, Ts: CausalTsProvider + 'static> Sto
             if let Err(e) = deadline.check() {
                 return callback(Err(Error::from(e)));
             }
-            let command_duration = tikv_util::time::Instant::now();
-
             if let Err(e) = Self::check_causal_ts_synced(&mut ctx).await {
                 return callback(Err(e));
             }
+
+            let command_duration = tikv_util::time::Instant::now();
             // get new ts after get key_guard to avoid cdc register_min_ts_event
             // use a smaller ts then ts used here.
             let key_guard = Self::get_raw_key_guard(&provider, concurrency_manager).await;
             if let Err(e) = key_guard {
                 return callback(Err(e));
             }
-            let ts = Self::get_causal_ts(&provider);
+            let ts = Self::get_causal_ts(&provider).await;
             if let Err(e) = ts {
                 return callback(Err(e));
             }
@@ -2063,7 +2060,7 @@ impl<E: Engine, L: LockManager, F: KvFormat, Ts: CausalTsProvider + 'static> Sto
             if let Err(e) = key_guard {
                 return callback(Err(e));
             }
-            let ts = Self::get_causal_ts(&provider);
+            let ts = Self::get_causal_ts(&provider).await;
             if let Err(e) = ts {
                 return callback(Err(e));
             }
@@ -2128,7 +2125,7 @@ impl<E: Engine, L: LockManager, F: KvFormat, Ts: CausalTsProvider + 'static> Sto
             if let Err(e) = key_guard {
                 return callback(Err(e));
             }
-            let ts = Self::get_causal_ts(&provider);
+            let ts = Self::get_causal_ts(&provider).await;
             if let Err(e) = ts {
                 return callback(Err(e));
             }
@@ -2237,7 +2234,7 @@ impl<E: Engine, L: LockManager, F: KvFormat, Ts: CausalTsProvider + 'static> Sto
             if let Err(e) = key_guard {
                 return callback(Err(e));
             }
-            let ts = Self::get_causal_ts(&provider);
+            let ts = Self::get_causal_ts(&provider).await;
             if let Err(e) = ts {
                 return callback(Err(e));
             }
@@ -2671,7 +2668,7 @@ impl<E: Engine, L: LockManager, F: KvFormat, Ts: CausalTsProvider + 'static> Sto
             if let Err(e) = key_guard {
                 return cb(Err(e));
             }
-            let ts = Self::get_causal_ts(&provider);
+            let ts = Self::get_causal_ts(&provider).await;
             if let Err(e) = ts {
                 return cb(Err(e));
             }
@@ -2721,28 +2718,11 @@ impl<E: Engine, L: LockManager, F: KvFormat, Ts: CausalTsProvider + 'static> Sto
         let sched = self.get_scheduler();
         let concurrency_manager = self.get_concurrency_manager();
         self.sched_raw_command(CMD, async move {
-            let snap_ctx = SnapContext {
-                pb_ctx: &ctx,
-                ..Default::default()
-            };
-            let snapshot =
-                Self::with_tls_engine(|engine| Self::snapshot(engine, snap_ctx)).await;
-            if let Err(e) = snapshot {
-                return callback(Err(e));
-            }
-            // TODO: Get snapshot twice. Txn scheduler will get snapshot again.
-            if !snapshot.unwrap().ext().is_max_ts_synced() {
-                return callback(Err(Error::from(txn::Error::from(TxnError::MaxTimestampNotSynced {
-                    region_id: ctx.get_region_id(),
-                    start_ts: TimeStamp::zero(),
-                }))));
-            }
-
             let key_guard = Self::get_raw_key_guard(&provider, concurrency_manager).await;
             if let Err(e) = key_guard {
                 return callback(Err(e));
             }
-            let ts = Self::get_causal_ts(&provider);
+            let ts = Self::get_causal_ts(&provider).await;
             if let Err(e) = ts {
                 return callback(Err(e));
             }
@@ -2775,28 +2755,11 @@ impl<E: Engine, L: LockManager, F: KvFormat, Ts: CausalTsProvider + 'static> Sto
         let sched = self.get_scheduler();
         let concurrency_manager = self.get_concurrency_manager();
         self.sched_raw_command(CMD, async move {
-            let snap_ctx = SnapContext {
-                pb_ctx: &ctx,
-                ..Default::default()
-            };
-            let snapshot =
-                Self::with_tls_engine(|engine| Self::snapshot(engine, snap_ctx)).await;
-            if let Err(e) = snapshot {
-                return callback(Err(e));
-            }
-            // TODO: Get snapshot twice. Txn scheduler will get snapshot again.
-            if !snapshot.unwrap().ext().is_max_ts_synced() {
-                return callback(Err(Error::from(txn::Error::from(TxnError::MaxTimestampNotSynced {
-                    region_id: ctx.get_region_id(),
-                    start_ts: TimeStamp::zero(),
-                }))));
-            }
-
             let key_guard = Self::get_raw_key_guard(&provider, concurrency_manager).await;
             if let Err(e) = key_guard {
                 return callback(Err(e));
             }
-            let ts = Self::get_causal_ts(&provider);
+            let ts = Self::get_causal_ts(&provider).await;
             if let Err(e) = ts {
                 return callback(Err(e));
             }
