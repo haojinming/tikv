@@ -14,7 +14,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use causal_ts::CausalTsProvider;
+use causal_ts::{CausalTs, CausalTsProvider};
 use collections::{HashMap, HashSet};
 use concurrency_manager::ConcurrencyManager;
 use engine_traits::{KvEngine, RaftEngine};
@@ -868,12 +868,11 @@ where
     }
 }
 
-pub struct Runner<EK, ER, T, Ts>
+pub struct Runner<EK, ER, T>
 where
     EK: KvEngine,
     ER: RaftEngine,
     T: PdClient + 'static,
-    Ts: CausalTsProvider,
 {
     store_id: u64,
     pd_client: Arc<T>,
@@ -905,15 +904,14 @@ where
     health_service: Option<HealthService>,
     curr_health_status: ServingStatus,
     coprocessor_host: CoprocessorHost<EK>,
-    causal_ts_provider: Option<Arc<Ts>>, // used for rawkv apiv2
+    causal_ts_provider: Option<Arc<CausalTs>>, // used for rawkv apiv2
 }
 
-impl<EK, ER, T, Ts> Runner<EK, ER, T, Ts>
+impl<EK, ER, T> Runner<EK, ER, T>
 where
     EK: KvEngine,
     ER: RaftEngine,
     T: PdClient + 'static,
-    Ts: CausalTsProvider + 'static,
 {
     const INTERVAL_DIVISOR: u32 = 2;
 
@@ -932,8 +930,8 @@ where
         region_read_progress: RegionReadProgressRegistry,
         health_service: Option<HealthService>,
         coprocessor_host: CoprocessorHost<EK>,
-        causal_ts_provider: Option<Arc<Ts>>, // used for rawkv apiv2
-    ) -> Runner<EK, ER, T, Ts> {
+        causal_ts_provider: Option<Arc<CausalTs>>, // used for rawkv apiv2
+    ) -> Runner<EK, ER, T> {
         // Register the region CPU records collector.
         let mut region_cpu_records_collector = None;
         if auto_split_controller
@@ -1815,12 +1813,11 @@ fn calculate_region_cpu_records(
     }
 }
 
-impl<EK, ER, T, Ts> Runnable for Runner<EK, ER, T, Ts>
+impl<EK, ER, T> Runnable for Runner<EK, ER, T>
 where
     EK: KvEngine,
     ER: RaftEngine,
     T: PdClient,
-    Ts: CausalTsProvider + 'static,
 {
     type Task = Task<EK, ER>;
 
@@ -2062,12 +2059,11 @@ where
     }
 }
 
-impl<EK, ER, T, Ts> RunnableWithTimer for Runner<EK, ER, T, Ts>
+impl<EK, ER, T> RunnableWithTimer for Runner<EK, ER, T>
 where
     EK: KvEngine,
     ER: RaftEngine,
     T: PdClient + 'static,
-    Ts: CausalTsProvider + 'static,
 {
     fn on_timeout(&mut self) {
         // The health status is recovered to serving as long as any tick

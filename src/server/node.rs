@@ -7,7 +7,7 @@ use std::{
 };
 
 use api_version::{api_v2::TIDB_RANGES_COMPLEMENT, KvFormat};
-use causal_ts::CausalTsProvider;
+use causal_ts::CausalTs;
 use concurrency_manager::ConcurrencyManager;
 use engine_traits::{Engines, Iterable, KvEngine, RaftEngine, DATA_CFS, DATA_KEY_PREFIX_LEN};
 use grpcio_health::HealthService;
@@ -48,13 +48,7 @@ const CHECK_CLUSTER_BOOTSTRAPPED_RETRY_INTERVAL: Duration = Duration::from_secs(
 
 /// Creates a new storage engine which is backed by the Raft consensus
 /// protocol.
-pub fn create_raft_storage<
-    S,
-    EK,
-    R: FlowStatsReporter,
-    F: KvFormat,
-    Ts: CausalTsProvider + 'static,
->(
+pub fn create_raft_storage<S, EK, R: FlowStatsReporter, F: KvFormat>(
     engine: RaftKv<EK, S>,
     cfg: &StorageConfig,
     read_pool: ReadPoolHandle,
@@ -66,8 +60,8 @@ pub fn create_raft_storage<
     resource_tag_factory: ResourceTagFactory,
     quota_limiter: Arc<QuotaLimiter>,
     feature_gate: FeatureGate,
-    causal_ts_provider: Option<Arc<Ts>>,
-) -> Result<Storage<RaftKv<EK, S>, LockManager, F, Ts>>
+    causal_ts_provider: Option<Arc<CausalTs>>, // used for rawkv apiv2
+) -> Result<Storage<RaftKv<EK, S>, LockManager, F>>
 where
     S: RaftStoreRouter<EK> + LocalReadRouter<EK> + 'static,
     EK: KvEngine,
@@ -201,7 +195,7 @@ where
     /// bootstrapped yet. Then it spawns a thread to run the raftstore in
     /// background.
     #[allow(clippy::too_many_arguments)]
-    pub fn start<T, Ts>(
+    pub fn start<T>(
         &mut self,
         engines: Engines<EK, ER>,
         trans: T,
@@ -214,11 +208,10 @@ where
         auto_split_controller: AutoSplitController,
         concurrency_manager: ConcurrencyManager,
         collector_reg_handle: CollectorRegHandle,
-        causal_ts_provider: Option<Arc<Ts>>, // used for rawkv apiv2
+        causal_ts_provider: Option<Arc<CausalTs>>, // used for rawkv apiv2
     ) -> Result<()>
     where
         T: Transport + 'static,
-        Ts: CausalTsProvider + 'static,
     {
         let store_id = self.id();
         {
@@ -480,7 +473,7 @@ where
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn start_store<T, Ts>(
+    fn start_store<T>(
         &mut self,
         store_id: u64,
         engines: Engines<EK, ER>,
@@ -494,11 +487,10 @@ where
         auto_split_controller: AutoSplitController,
         concurrency_manager: ConcurrencyManager,
         collector_reg_handle: CollectorRegHandle,
-        causal_ts_provider: Option<Arc<Ts>>, // used for rawkv apiv2
+        causal_ts_provider: Option<Arc<CausalTs>>, // used for rawkv apiv2
     ) -> Result<()>
     where
         T: Transport + 'static,
-        Ts: CausalTsProvider + 'static,
     {
         info!("start raft store thread"; "store_id" => store_id);
 

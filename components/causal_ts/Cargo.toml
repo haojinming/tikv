@@ -12,6 +12,7 @@ api_version = { path = "../api_version", default-features = false }
 async-trait = { version = "0.1" }
 engine_rocks = { path = "../engine_rocks", default-features = false }
 engine_traits = { path = "../engine_traits", default-features = false }
+enum_dispatch = "0.3.8"
 error_code = { path = "../error_code", default-features = false }
 fail = "0.5"
 futures = { version = "0.3" }

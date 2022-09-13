@@ -1,11 +1,16 @@
 // Copyright 2021 TiKV Project Authors. Licensed under Apache-2.0.
 
 // #[PerformanceCriticalPath]
+use std::sync::Arc;
+
+use causal_ts::CausalTs;
 use engine_traits::CfName;
+use futures::executor::block_on;
 use tikv_kv::SnapshotExt;
 use txn_types::TimeStamp;
 
 use crate::storage::{
+    get_causal_ts, get_raw_key_guard,
     kv::{Modify, WriteData},
     lock_manager::LockManager,
     txn::{
@@ -27,7 +32,7 @@ command! {
             /// The set of mutations to apply.
             cf: CfName,
             mutations: Vec<Modify>,
-            data_ts: Option<TimeStamp>,
+            causal_ts_provider: Option<Arc<CausalTs>>,
         }
 }
 
@@ -42,7 +47,7 @@ impl CommandExt for RawAtomicStore {
 }
 
 impl<S: Snapshot, L: LockManager> WriteCommand<S, L> for RawAtomicStore {
-    fn process_write(self, snapshot: S, _: WriteContext<'_, L>) -> Result<WriteResult> {
+    fn process_write(self, snapshot: S, wctx: WriteContext<'_, L>) -> Result<WriteResult> {
         if !snapshot.ext().is_max_ts_synced() {
             return Err(ErrorInner::MaxTimestampNotSynced {
                 region_id: self.ctx.get_region_id(),
@@ -51,9 +56,28 @@ impl<S: Snapshot, L: LockManager> WriteCommand<S, L> for RawAtomicStore {
             .into());
         }
 
+        let provider = self.causal_ts_provider.clone();
+        let concurrency_manager = wctx.concurrency_manager.clone();
+
+        let lock_guard = block_on(get_raw_key_guard(&provider, concurrency_manager));
+        if let Err(e) = lock_guard {
+            panic!("error {}", e);
+        }
+        let lock_guard = lock_guard.unwrap();
+        let lock_guards = if let Some(lock_guard) = lock_guard {
+            vec![lock_guard]
+        } else {
+            vec![]
+        };
+        let ts = block_on(get_causal_ts(&provider));
+        if let Err(e) = ts {
+            panic!("error {}", e);
+        }
+        let ts = ts.unwrap();
+
         let rows = self.mutations.len();
         let (mut mutations, ctx) = (self.mutations, self.ctx);
-        if let Some(ts) = self.data_ts {
+        if let Some(ts) = ts {
             for mutation in &mut mutations {
                 if let Modify::Put(_, ref mut key, _) = mutation {
                     key.append_ts_inplace(ts);
@@ -68,7 +92,7 @@ impl<S: Snapshot, L: LockManager> WriteCommand<S, L> for RawAtomicStore {
             rows,
             pr: ProcessResult::Res,
             lock_info: None,
-            lock_guards: vec![],
+            lock_guards,
             response_policy: ResponsePolicy::OnApplied,
         })
     }
@@ -112,7 +136,7 @@ mod tests {
                 F::encode_raw_value_owned(raw_value),
             ));
         }
-        let cmd = RawAtomicStore::new(CF_DEFAULT, modifies, encode_ts, Context::default());
+        let cmd = RawAtomicStore::new(CF_DEFAULT, modifies, None, Context::default());
         let mut statistic = Statistics::default();
         let snap = engine.snapshot(Default::default()).unwrap();
         let context = WriteContext {
@@ -133,7 +157,7 @@ mod tests {
             };
             modifies_with_ts.push(Modify::Put(
                 CF_DEFAULT,
-                F::encode_raw_key_owned(raw_keys[i].to_vec(), encode_ts),
+                F::encode_raw_key_owned(raw_keys[i].to_vec(), None),
                 F::encode_raw_value_owned(raw_value),
             ));
         }

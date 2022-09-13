@@ -1,14 +1,19 @@
 // Copyright 2021 TiKV Project Authors. Licensed under Apache-2.0.
 
 // #[PerformanceCriticalPath]
+use std::sync::Arc;
+
 use api_version::{match_template_api_version, KvFormat, RawValue};
+use causal_ts::CausalTs;
 use engine_traits::{raw_ttl::ttl_to_expire_ts, CfName};
+use futures::executor::block_on;
 use kvproto::kvrpcpb::ApiVersion;
 use raw::RawStore;
 use tikv_kv::{SnapshotExt, Statistics};
 use txn_types::{Key, TimeStamp, Value};
 
 use crate::storage::{
+    get_causal_ts, get_raw_key_guard,
     kv::{Modify, WriteData},
     lock_manager::LockManager,
     raw,
@@ -37,7 +42,7 @@ command! {
             value: Value,
             ttl: u64,
             api_version: ApiVersion,
-            data_ts: Option<TimeStamp>,
+            causal_ts_provider: Option<Arc<CausalTs>>,
         }
 }
 
@@ -52,7 +57,7 @@ impl CommandExt for RawCompareAndSwap {
 }
 
 impl<S: Snapshot, L: LockManager> WriteCommand<S, L> for RawCompareAndSwap {
-    fn process_write(self, snapshot: S, _: WriteContext<'_, L>) -> Result<WriteResult> {
+    fn process_write(self, snapshot: S, wctx: WriteContext<'_, L>) -> Result<WriteResult> {
         if !snapshot.ext().is_max_ts_synced() {
             return Err(ErrorInner::MaxTimestampNotSynced {
                 region_id: self.ctx.get_region_id(),
@@ -61,6 +66,8 @@ impl<S: Snapshot, L: LockManager> WriteCommand<S, L> for RawCompareAndSwap {
             .into());
         }
 
+        let provider = self.causal_ts_provider.clone();
+        let concurrency_manager = wctx.concurrency_manager.clone();
         let (cf, mut key, value, previous_value, ctx) =
             (self.cf, self.key, self.value, self.previous_value, self.ctx);
         let mut data = vec![];
@@ -70,7 +77,7 @@ impl<S: Snapshot, L: LockManager> WriteCommand<S, L> for RawCompareAndSwap {
             &mut Statistics::default(),
         )?;
 
-        let pr = if old_value == previous_value {
+        let (pr, lock_guards) = if old_value == previous_value {
             let raw_value = RawValue {
                 user_value: value,
                 expire_ts: ttl_to_expire_ts(self.ttl),
@@ -82,20 +89,43 @@ impl<S: Snapshot, L: LockManager> WriteCommand<S, L> for RawCompareAndSwap {
                     ApiVersion::API => API::encode_raw_value_owned(raw_value),
                 }
             );
-            if let Some(ts) = self.data_ts {
+
+            let lock_guard = block_on(get_raw_key_guard(&provider, concurrency_manager));
+            if let Err(e) = lock_guard {
+                panic!("error {}", e);
+            }
+            let lock_guard = lock_guard.unwrap();
+            let lock_guards = if let Some(lock_guard) = lock_guard {
+                vec![lock_guard]
+            } else {
+                vec![]
+            };
+            let ts = block_on(get_causal_ts(&provider));
+            if let Err(e) = ts {
+                panic!("error {}", e);
+            }
+            let ts = ts.unwrap();
+            if let Some(ts) = ts {
                 key = key.append_ts(ts);
             }
+
             let m = Modify::Put(cf, key, encoded_raw_value);
             data.push(m);
-            ProcessResult::RawCompareAndSwapRes {
-                previous_value: old_value,
-                succeed: true,
-            }
+            (
+                ProcessResult::RawCompareAndSwapRes {
+                    previous_value: old_value,
+                    succeed: true,
+                },
+                lock_guards,
+            )
         } else {
-            ProcessResult::RawCompareAndSwapRes {
-                previous_value: old_value,
-                succeed: false,
-            }
+            (
+                ProcessResult::RawCompareAndSwapRes {
+                    previous_value: old_value,
+                    succeed: false,
+                },
+                vec![],
+            )
         };
         fail_point!("txn_commands_compare_and_swap");
         let rows = data.len();
@@ -107,7 +137,7 @@ impl<S: Snapshot, L: LockManager> WriteCommand<S, L> for RawCompareAndSwap {
             rows,
             pr,
             lock_info: None,
-            lock_guards: vec![],
+            lock_guards,
             response_policy: ResponsePolicy::OnApplied,
         })
     }
@@ -230,11 +260,6 @@ mod tests {
         let cm = concurrency_manager::ConcurrencyManager::new(1.into());
         let raw_key = b"rk";
         let raw_value = b"valuek";
-        let encode_ts = if F::TAG == kvproto::kvrpcpb::ApiVersion::V2 {
-            Some(TimeStamp::from(100))
-        } else {
-            None
-        };
         let ttl = 30;
         let encode_value = RawValue {
             user_value: raw_value.to_vec(),
@@ -248,7 +273,7 @@ mod tests {
             raw_value.to_vec(),
             ttl,
             F::TAG,
-            encode_ts,
+            None,
             Context::default(),
         );
         let mut statistic = Statistics::default();
@@ -264,7 +289,7 @@ mod tests {
         let write_result = cmd.process_write(snap, context).unwrap();
         let modifies_with_ts = vec![Modify::Put(
             CF_DEFAULT,
-            F::encode_raw_key(raw_key, encode_ts),
+            F::encode_raw_key(raw_key, None),
             F::encode_raw_value_owned(encode_value),
         )];
         assert_eq!(write_result.to_be_write.modifies, modifies_with_ts)

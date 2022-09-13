@@ -9,7 +9,7 @@ use std::{
 };
 
 use api_version::{dispatch_api_version, KvFormat};
-use causal_ts::BatchTsoProvider;
+use causal_ts::CausalTs;
 use collections::{HashMap, HashSet};
 use concurrency_manager::ConcurrencyManager;
 use encryption_export::DataKeyManager;
@@ -154,7 +154,7 @@ pub struct ServerCluster {
     raft_client: RaftClient<AddressMap, RaftStoreBlackHole, RocksEngine>,
     concurrency_managers: HashMap<u64, ConcurrencyManager>,
     env: Arc<Environment>,
-    pub causal_ts_providers: HashMap<u64, Arc<BatchTsoProvider<TestPdClient>>>,
+    pub causal_ts_providers: HashMap<u64, Arc<CausalTs>>,
 }
 
 impl ServerCluster {
@@ -225,10 +225,7 @@ impl ServerCluster {
         self.concurrency_managers.get(&node_id).unwrap().clone()
     }
 
-    pub fn get_causal_ts_provider(
-        &self,
-        node_id: u64,
-    ) -> Option<Arc<BatchTsoProvider<TestPdClient>>> {
+    pub fn get_causal_ts_provider(&self, node_id: u64) -> Option<Arc<CausalTs>> {
         self.causal_ts_providers.get(&node_id).cloned()
     }
 
@@ -372,16 +369,8 @@ impl ServerCluster {
         };
 
         if ApiVersion::V2 == F::TAG {
-            let causal_ts_provider = Arc::new(
-                block_on(causal_ts::BatchTsoProvider::new_opt(
-                    self.pd_client.clone(),
-                    cfg.causal_ts.renew_interval.0,
-                    cfg.causal_ts.available_interval.0,
-                    cfg.causal_ts.renew_batch_min_size,
-                    cfg.causal_ts.renew_batch_max_size,
-                ))
-                .unwrap(),
-            );
+            let causal_ts_provider: Arc<CausalTs> =
+                Arc::new(causal_ts::tests::TestProvider::default().into());
             self.causal_ts_providers
                 .insert(node_id, causal_ts_provider.clone());
             let causal_ob = causal_ts::CausalObserver::new(causal_ts_provider);
@@ -392,7 +381,8 @@ impl ServerCluster {
         let (res_tag_factory, collector_reg_handle, rsmeter_cleanup) =
             self.init_resource_metering(&cfg.resource_metering);
 
-        let check_leader_runner = CheckLeaderRunner::new(store_meta.clone());
+        let check_leader_runner =
+            CheckLeaderRunner::new(store_meta.clone(), coprocessor_host.clone());
         let check_leader_scheduler = bg_worker.start("check-leader", check_leader_runner);
 
         let mut lock_mgr = LockManager::new(&cfg.pessimistic_txn);
@@ -406,7 +396,7 @@ impl ServerCluster {
             cfg.quota.max_delay_duration,
             cfg.quota.enable_auto_tune,
         ));
-        let store = create_raft_storage::<_, _, _, F, _>(
+        let store = create_raft_storage::<_, _, _, F>(
             engine,
             &cfg.storage,
             storage_read_pool.handle(),

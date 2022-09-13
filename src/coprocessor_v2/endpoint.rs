@@ -3,7 +3,6 @@
 use std::{future::Future, sync::Arc};
 
 use api_version::KvFormat;
-use causal_ts::CausalTsProvider;
 use coprocessor_plugin_api::*;
 use kvproto::kvrpcpb;
 use semver::VersionReq;
@@ -54,14 +53,9 @@ impl Endpoint {
     /// on it's `copr_name` field. A plugin with a matching name must be loaded
     /// by TiKV, otherwise an error is returned.
     #[inline]
-    pub fn handle_request<
-        E: Engine,
-        L: LockManager,
-        F: KvFormat,
-        Ts: CausalTsProvider + 'static,
-    >(
+    pub fn handle_request<E: Engine, L: LockManager, F: KvFormat>(
         &self,
-        storage: &Storage<E, L, F, Ts>,
+        storage: &Storage<E, L, F>,
         req: kvrpcpb::RawCoprocessorRequest,
     ) -> impl Future<Output = kvrpcpb::RawCoprocessorResponse> {
         let mut response = kvrpcpb::RawCoprocessorResponse::default();
@@ -78,14 +72,9 @@ impl Endpoint {
     }
 
     #[inline]
-    fn handle_request_impl<
-        E: Engine,
-        L: LockManager,
-        F: KvFormat,
-        Ts: CausalTsProvider + 'static,
-    >(
+    fn handle_request_impl<E: Engine, L: LockManager, F: KvFormat>(
         &self,
-        storage: &Storage<E, L, F, Ts>,
+        storage: &Storage<E, L, F>,
         mut req: kvrpcpb::RawCoprocessorRequest,
     ) -> Result<RawResponse, CoprocessorError> {
         let plugin_registry = self
