@@ -1908,6 +1908,10 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
         let provider = self.causal_ts_provider.clone();
         let engine = self.engine.clone();
         let concurrency_manager = self.concurrency_manager.clone();
+        let region_id = ctx.region_id;
+        let term = ctx.term;
+        let epoch_conf_ver = ctx.region_epoch.get_ref().conf_ver;
+        let epoch_ver = ctx.region_epoch.get_ref().version;
         self.sched_raw_command(CMD, async move {
             if let Err(e) = deadline.check() {
                 return callback(Err(Error::from(e)));
@@ -1921,6 +1925,19 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
             if let Err(e) = ts {
                 return callback(Err(e));
             }
+            let log_key = key.clone();
+            let log_value = value.clone();
+            let ts = ts.unwrap();
+            info!("HJM DEBUG, raw put kv start."; 
+                "key"=> &log_wrappers::Value::key(&log_key),
+                "ts" => ts,
+                "value" => &log_wrappers::Value::key(&log_value),
+                "region" => region_id,
+                "term" => term,
+                "epoch_conf_ver" => epoch_conf_ver,
+                "epoch_ver" => epoch_ver,
+            );
+
             let raw_value = RawValue {
                 user_value: value,
                 expire_ts: ttl_to_expire_ts(ttl),
@@ -1928,7 +1945,7 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
             };
             let m = Modify::Put(
                 cf,
-                F::encode_raw_key_owned(key, ts.unwrap()),
+                F::encode_raw_key_owned(key, ts),
                 F::encode_raw_value_owned(raw_value),
             );
 
@@ -1941,6 +1958,17 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
                 Err(e) => Err(Error::from(e)),
                 Ok(_) => f.await.unwrap(),
             };
+            if v.is_ok() {
+                info!("HJM DEBUG, raw put kv finish with succeed."; 
+                    "key"=> &log_wrappers::Value::key(&log_key),
+                    "ts" => ts,
+                    "value" => &log_wrappers::Value::key(&log_value),
+                    "region" => region_id,
+                    "term" => term,
+                    "epoch_conf_ver" => epoch_conf_ver,
+                    "epoch_ver" => epoch_ver,
+                );
+            }
             callback(v);
             KV_COMMAND_COUNTER_VEC_STATIC.get(CMD).inc();
             SCHED_STAGE_COUNTER_VEC.get(CMD).write_finish.inc();
@@ -2076,6 +2104,10 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
         let engine = self.engine.clone();
         let concurrency_manager = self.concurrency_manager.clone();
         let deadline = Self::get_deadline(&ctx);
+        let region_id = ctx.region_id;
+        let term = ctx.term;
+        let epoch_conf_ver = ctx.region_epoch.get_ref().conf_ver;
+        let epoch_ver = ctx.region_epoch.get_ref().version;
         self.sched_raw_command(CMD, async move {
             if let Err(e) = deadline.check() {
                 return callback(Err(Error::from(e)));
@@ -2090,7 +2122,17 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
             if let Err(e) = ts {
                 return callback(Err(e));
             }
-            let m = Self::raw_delete_request_to_modify(cf, key, ts.unwrap());
+            let log_key = key.clone();
+            let ts = ts.unwrap();
+            info!("HJM DEBUG, raw delete kv start."; 
+                "key"=> &log_wrappers::Value::key(&log_key),
+                "ts" => ts,
+                "region" => region_id,
+                "term" => term,
+                "epoch_conf_ver" => epoch_conf_ver,
+                "epoch_ver" => epoch_ver,
+            );
+            let m = Self::raw_delete_request_to_modify(cf, key, ts);
             let mut batch = WriteData::from_modifies(vec![m]);
             batch.set_allowed_on_disk_almost_full();
             let (cb, f) = tikv_util::future::paired_future_callback();
@@ -2100,6 +2142,16 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
                 Err(e) => Err(Error::from(e)),
                 Ok(_) => f.await.unwrap(),
             };
+            if v.is_ok() {
+                info!("HJM DEBUG, raw delete kv finish with succeed."; 
+                    "key"=> &log_wrappers::Value::key(&log_key),
+                    "ts" => ts,
+                    "region" => region_id,
+                    "term" => term,
+                    "epoch_conf_ver" => epoch_conf_ver,
+                    "epoch_ver" => epoch_ver,
+                );
+            }
             callback(v);
             KV_COMMAND_COUNTER_VEC_STATIC.get(CMD).inc();
             SCHED_STAGE_COUNTER_VEC.get(CMD).write_finish.inc();

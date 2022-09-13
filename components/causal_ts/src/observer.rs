@@ -57,7 +57,7 @@ impl<Ts: CausalTsProvider> CausalObserver<Ts> {
         if let Err(err) = self.causal_ts_provider.flush() {
             warn!("CausalObserver::flush_timestamp error"; "error" => ?err, "region_id" => region.get_id(), "region" => ?region, "reason" => reason);
         } else {
-            debug!("CausalObserver::flush_timestamp succeed"; "region_id" => region.get_id(), "region" => ?region, "reason" => reason);
+            info!("CausalObserver::flush_timestamp succeed"; "region_id" => region.get_id(), "region" => ?region, "reason" => reason);
         }
     }
 }
