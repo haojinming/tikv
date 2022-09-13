@@ -24,7 +24,7 @@ use crate::storage::{
         },
         ErrorInner, Result,
     },
-    ProcessResult, Snapshot,
+    Error as StorageError, ProcessResult, Snapshot,
 };
 
 // TODO: consider add `KvFormat` generic parameter.
@@ -90,21 +90,17 @@ impl<S: Snapshot, L: LockManager> WriteCommand<S, L> for RawCompareAndSwap {
                 }
             );
 
-            let lock_guard = block_on(get_raw_key_guard(&provider, concurrency_manager));
-            if let Err(e) = lock_guard {
-                panic!("error {}", e);
-            }
-            let lock_guard = lock_guard.unwrap();
+            let lock_guard = block_on(get_raw_key_guard(&provider, concurrency_manager)).map_err(
+                |err: StorageError| ErrorInner::Other(box_err!("failed to key guard: {:?}", err)),
+            )?;
             let lock_guards = if let Some(lock_guard) = lock_guard {
                 vec![lock_guard]
             } else {
                 vec![]
             };
-            let ts = block_on(get_causal_ts(&provider));
-            if let Err(e) = ts {
-                panic!("error {}", e);
-            }
-            let ts = ts.unwrap();
+            let ts = block_on(get_causal_ts(&provider)).map_err(|err: StorageError| {
+                ErrorInner::Other(box_err!("failed to get casual ts: {:?}", err))
+            })?;
             if let Some(ts) = ts {
                 key = key.append_ts(ts);
             }
@@ -168,8 +164,10 @@ mod tests {
         let key = b"rk";
 
         let encoded_key = F::encode_raw_key(key, None);
-        let mut ts = if F::TAG == kvproto::kvrpcpb::ApiVersion::V2 {
-            Some(TimeStamp::from(100))
+        let ts_provider = if F::TAG == kvproto::kvrpcpb::ApiVersion::V2 {
+            let test_provider: causal_ts::CausalTs =
+                causal_ts::tests::TestProvider::default().into();
+            Some(Arc::new(test_provider))
         } else {
             None
         };
@@ -181,14 +179,13 @@ mod tests {
             b"v1".to_vec(),
             0,
             F::TAG,
-            ts,
+            ts_provider.clone(),
             Context::default(),
         );
         let (prev_val, succeed) = sched_command(&engine, cm.clone(), cmd).unwrap();
         assert!(prev_val.is_none());
         assert!(succeed);
 
-        ts = ts.map(|t| t.next());
         let cmd = RawCompareAndSwap::new(
             CF_DEFAULT,
             encoded_key.clone(),
@@ -196,14 +193,13 @@ mod tests {
             b"v2".to_vec(),
             1,
             F::TAG,
-            ts,
+            ts_provider.clone(),
             Context::default(),
         );
         let (prev_val, succeed) = sched_command(&engine, cm.clone(), cmd).unwrap();
         assert_eq!(prev_val, Some(b"v1".to_vec()));
         assert!(!succeed);
 
-        ts = ts.map(|t| t.next());
         let cmd = RawCompareAndSwap::new(
             CF_DEFAULT,
             encoded_key,
@@ -211,7 +207,7 @@ mod tests {
             b"v3".to_vec(),
             2,
             F::TAG,
-            ts,
+            ts_provider,
             Context::default(),
         );
         let (prev_val, succeed) = sched_command(&engine, cm, cmd).unwrap();
@@ -256,6 +252,13 @@ mod tests {
     }
 
     fn test_cas_process_write_impl<F: KvFormat>() {
+        let ts_provider = if F::TAG == kvproto::kvrpcpb::ApiVersion::V2 {
+            let test_provider: causal_ts::CausalTs =
+                causal_ts::tests::TestProvider::default().into();
+            Some(Arc::new(test_provider))
+        } else {
+            None
+        };
         let engine = TestEngineBuilder::new().build().unwrap();
         let cm = concurrency_manager::ConcurrencyManager::new(1.into());
         let raw_key = b"rk";
@@ -273,7 +276,7 @@ mod tests {
             raw_value.to_vec(),
             ttl,
             F::TAG,
-            None,
+            ts_provider,
             Context::default(),
         );
         let mut statistic = Statistics::default();
@@ -289,7 +292,7 @@ mod tests {
         let write_result = cmd.process_write(snap, context).unwrap();
         let modifies_with_ts = vec![Modify::Put(
             CF_DEFAULT,
-            F::encode_raw_key(raw_key, None),
+            F::encode_raw_key(raw_key, Some(100.into())),
             F::encode_raw_value_owned(encode_value),
         )];
         assert_eq!(write_result.to_be_write.modifies, modifies_with_ts)

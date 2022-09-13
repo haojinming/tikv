@@ -20,7 +20,7 @@ use crate::storage::{
         },
         ErrorInner, Result,
     },
-    ProcessResult, Snapshot,
+    Error as StorageError, ProcessResult, Snapshot,
 };
 
 command! {
@@ -58,22 +58,17 @@ impl<S: Snapshot, L: LockManager> WriteCommand<S, L> for RawAtomicStore {
 
         let provider = self.causal_ts_provider.clone();
         let concurrency_manager = wctx.concurrency_manager.clone();
-
-        let lock_guard = block_on(get_raw_key_guard(&provider, concurrency_manager));
-        if let Err(e) = lock_guard {
-            panic!("error {}", e);
-        }
-        let lock_guard = lock_guard.unwrap();
+        let lock_guard = block_on(get_raw_key_guard(&provider, concurrency_manager)).map_err(
+            |err: StorageError| ErrorInner::Other(box_err!("failed to key guard: {:?}", err)),
+        )?;
         let lock_guards = if let Some(lock_guard) = lock_guard {
             vec![lock_guard]
         } else {
             vec![]
         };
-        let ts = block_on(get_causal_ts(&provider));
-        if let Err(e) = ts {
-            panic!("error {}", e);
-        }
-        let ts = ts.unwrap();
+        let ts = block_on(get_causal_ts(&provider)).map_err(|err: StorageError| {
+            ErrorInner::Other(box_err!("failed to get casual ts: {:?}", err))
+        })?;
 
         let rows = self.mutations.len();
         let (mut mutations, ctx) = (self.mutations, self.ctx);
@@ -118,8 +113,10 @@ mod tests {
         let cm = concurrency_manager::ConcurrencyManager::new(1.into());
         let raw_keys = vec![b"ra", b"rz"];
         let raw_values = vec![b"valuea", b"valuez"];
-        let encode_ts = if F::TAG == kvproto::kvrpcpb::ApiVersion::V2 {
-            Some(TimeStamp::from(100))
+        let ts_provider = if F::TAG == kvproto::kvrpcpb::ApiVersion::V2 {
+            let test_provider: causal_ts::CausalTs =
+                causal_ts::tests::TestProvider::default().into();
+            Some(Arc::new(test_provider))
         } else {
             None
         };
@@ -136,7 +133,7 @@ mod tests {
                 F::encode_raw_value_owned(raw_value),
             ));
         }
-        let cmd = RawAtomicStore::new(CF_DEFAULT, modifies, None, Context::default());
+        let cmd = RawAtomicStore::new(CF_DEFAULT, modifies, ts_provider, Context::default());
         let mut statistic = Statistics::default();
         let snap = engine.snapshot(Default::default()).unwrap();
         let context = WriteContext {
@@ -157,7 +154,7 @@ mod tests {
             };
             modifies_with_ts.push(Modify::Put(
                 CF_DEFAULT,
-                F::encode_raw_key_owned(raw_keys[i].to_vec(), None),
+                F::encode_raw_key_owned(raw_keys[i].to_vec(), Some(100.into())),
                 F::encode_raw_value_owned(raw_value),
             ));
         }
