@@ -2616,7 +2616,6 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
         }
         let provider = self.causal_ts_provider.clone();
         let sched = self.get_scheduler();
-        let concurrency_manager = self.get_concurrency_manager();
         self.sched_raw_command(CMD, async move {
             // Do NOT encode ts here as RawCompareAndSwap use key to gen lock.
             let key = F::encode_raw_key_owned(key, None);
@@ -2661,7 +2660,6 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
 
         let provider = self.causal_ts_provider.clone();
         let sched = self.get_scheduler();
-        let concurrency_manager = self.get_concurrency_manager();
         self.sched_raw_command(CMD, async move {
             let modifies = Self::raw_batch_put_requests_to_modifies(cf, pairs, ttls, None);
             let cmd = RawAtomicStore::new(cf, modifies, provider, ctx);
@@ -2688,7 +2686,6 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
         let cf = Self::rawkv_cf(&cf, self.api_version)?;
         let provider = self.causal_ts_provider.clone();
         let sched = self.get_scheduler();
-        let concurrency_manager = self.get_concurrency_manager();
         self.sched_raw_command(CMD, async move {
             let modifies = keys
                 .into_iter()
