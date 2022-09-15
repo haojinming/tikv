@@ -2604,7 +2604,7 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
         previous_value: Option<Vec<u8>>,
         value: Vec<u8>,
         ttl: u64,
-        cb: Callback<(Option<Value>, bool)>,
+        callback: Callback<(Option<Value>, bool)>,
     ) -> Result<()> {
         const CMD: CommandKind = CommandKind::raw_compare_and_swap;
         let api_version = self.api_version;
@@ -2618,20 +2618,6 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
         let sched = self.get_scheduler();
         let concurrency_manager = self.get_concurrency_manager();
         self.sched_raw_command(CMD, async move {
-            // Raw atomic cmd has two locks, one is concurrency_manager and the other is txn
-            // latch. Now, concurrency_manager lock key with ts encoded, it aims
-            // to "lock" resolved-ts to be less than its timestamp, rather than
-            // to "lock" other concurrent requests. TODO: Merge the two locks
-            // into one to simplify the process. Same to other raw atomic
-            // commands.
-            let key_guard = get_raw_key_guard(&provider, concurrency_manager).await;
-            if let Err(e) = key_guard {
-                return cb(Err(e));
-            }
-            let ts = get_causal_ts(&provider).await;
-            if let Err(e) = ts {
-                return cb(Err(e));
-            }
             // Do NOT encode ts here as RawCompareAndSwap use key to gen lock.
             let key = F::encode_raw_key_owned(key, None);
             let cmd = RawCompareAndSwap::new(
@@ -2648,8 +2634,7 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
                 sched,
                 cmd,
                 Box::new(|res| {
-                    cb(res.map_err(Error::from));
-                    drop(key_guard)
+                    callback(res.map_err(Error::from))
                 }),
             );
         })
@@ -2678,23 +2663,13 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
         let sched = self.get_scheduler();
         let concurrency_manager = self.get_concurrency_manager();
         self.sched_raw_command(CMD, async move {
-            let key_guard = get_raw_key_guard(&provider, concurrency_manager).await;
-            if let Err(e) = key_guard {
-                return callback(Err(e));
-            }
-            let ts = get_causal_ts(&provider).await;
-            if let Err(e) = ts {
-                return callback(Err(e));
-            }
-            // Do NOT encode ts here as RawAtomicStore use key to gen lock
             let modifies = Self::raw_batch_put_requests_to_modifies(cf, pairs, ttls, None);
             let cmd = RawAtomicStore::new(cf, modifies, provider, ctx);
             Self::sched_raw_atomic_command(
                 sched,
                 cmd,
                 Box::new(|res| {
-                    callback(res.map_err(Error::from));
-                    drop(key_guard)
+                    callback(res.map_err(Error::from))
                 }),
             );
         })
@@ -2715,15 +2690,6 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
         let sched = self.get_scheduler();
         let concurrency_manager = self.get_concurrency_manager();
         self.sched_raw_command(CMD, async move {
-            let key_guard = get_raw_key_guard(&provider, concurrency_manager).await;
-            if let Err(e) = key_guard {
-                return callback(Err(e));
-            }
-            let ts = get_causal_ts(&provider).await;
-            if let Err(e) = ts {
-                return callback(Err(e));
-            }
-            // Do NOT encode ts here as RawAtomicStore use key to gen lock
             let modifies = keys
                 .into_iter()
                 .map(|k| Self::raw_delete_request_to_modify(cf, k, None))
@@ -2733,8 +2699,7 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
                 sched,
                 cmd,
                 Box::new(|res| {
-                    callback(res.map_err(Error::from));
-                    drop(key_guard)
+                    callback(res.map_err(Error::from))
                 }),
             );
         })
